@@ -811,9 +811,9 @@ static void property_get_state(void)
 *****************************************************************************/
 static int init(const bt_vendor_callbacks_t *p_cb, unsigned char *local_bdaddr)
 {
-    ALOGI("amlbt init 0x2024-0709-1950\n");
-    ALOGI("Iec01ba7413a73da720df8e63c9097a33d4258741\n");
-    ALOGI("release base commit:1d1e89a79672a47aee49afdd3e2b8e07e27ee489 2024-07-26\n");
+    ALOGI("amlbt release init 0x2024-0821-1954\n");
+    ALOGI("I1b034743deac6dfde92346a715774f36b96e2c4b\n");
+    ALOGI("release base commit:bb2e79fb184ca4ddf6686f77cdb0bf91f6a6fe67 \n");
 
     if (p_cb == NULL)
     {
@@ -1650,7 +1650,7 @@ static int op(bt_vendor_opcode_t opcode, void *param)
             }
             if (!recovery_flag)
             {
-                if ((amlbt_transtype.family_id > AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
+                if ((amlbt_transtype.family_id >= AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
                     && hw_cfg_cb.state == 0)
                 {
                     property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
@@ -1675,13 +1675,6 @@ static int op(bt_vendor_opcode_t opcode, void *param)
                     {
                         aml_shutdown_configure(g_userial_fd);
                     }
-                }
-                if ((amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface == AML_INTF_SDIO) \
-                        && hw_cfg_cb.state == 0)
-                {
-                    usleep(100000);
-                    aml_reset_bt(g_userial_fd);
-                    usleep(100000);
                 }
             }
             if (amlbt_transtype.family_id == AML_W2 && amlbt_transtype.interface == AML_INTF_USB)

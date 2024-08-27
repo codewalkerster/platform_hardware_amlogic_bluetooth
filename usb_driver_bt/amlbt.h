@@ -83,6 +83,7 @@ typedef unsigned long SYS_TYPE;
 
 #define BT_ICCM_AHB_BASE        0x00300000
 #define BT_DCCM_AHB_BASE        0x00400000
+#define BT_WIFI_AHB_BASE        0x00a12800
 
 #define WF_SRAM_FD_INIT_FLAG		(1 << 1)	//driver init flag
 

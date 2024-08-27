@@ -97,6 +97,8 @@ extern unsigned int amlbt_pin_mux;
 extern unsigned int amlbt_br_digit_gain;
 extern unsigned int amlbt_edr_digit_gain;
 extern unsigned int amlbt_fwlog_config;
+extern unsigned char APCF_config_manf_data[256];
+extern unsigned int amlbt_manf_cnt;
 
 extern unsigned int hw_state;
 unsigned int state = 0;
@@ -1746,6 +1748,7 @@ uint8_t hw_cfg_download_firmware_dccm_uart(void *p_mem, HC_BT_HDR *p_buf, uint8_
     {
         ALOGI("dccm write over successfully. ");
         hw_cfg_cb.state = HW_CFG_AML_DOWNLOAD_FIRMWARE_CLOSE_EVENT;
+        cnt = 0;
     }
 
     return is_proceeding;
@@ -1889,8 +1892,16 @@ uint8_t hw_cfg_download_firmware_start_cpu_uart(void *p_mem, HC_BT_HDR *p_buf, u
     UINT16_TO_STREAM(p, TCI_WRITE_REG);
     *p++ = 8;
     UINT32_TO_STREAM(p, REG_DEV_RESET);
-    UINT32_TO_STREAM(p, (unsigned int)((BIT_CPU | BIT_MAC | BIT_PHY) << DEV_RESET_SW));
-
+    if (amlbt_transtype.family_id == AML_W1 || amlbt_transtype.family_id == AML_W1U)
+    {
+        UINT32_TO_STREAM(p, (unsigned int)((BIT_CPU | BIT_MAC | BIT_PHY) << 8));
+        BTHWDBG("%#x", ((BIT_CPU | BIT_MAC | BIT_PHY) << 8));
+    }
+    else
+    {
+        UINT32_TO_STREAM(p, (unsigned int)((BIT_CPU | BIT_MAC | BIT_PHY) << DEV_RESET_SW));
+        BTHWDBG("%#x", ((BIT_CPU | BIT_MAC | BIT_PHY) << DEV_RESET_SW));
+    }
     p_buf->len = HCI_CMD_PREAMBLE_SIZE + \
                  8;
     hw_cfg_cb.state = HW_CFG_SET_PARAMS;
@@ -2142,35 +2153,45 @@ uint8_t hw_cfg_set_bd_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
                   HCI_EVT_CMD_CMPL_LOCAL_FW_VERSION;
     int i;
     uint8_t is_proceeding = FALSE;
-
-    uint8_t APCF_config_manf_data[] = {0x05, 0x19, 0xff,0x01, 0x0a,0xb};
-
-    property_get("persist.vendor.bt_name", chip_name, "unknown");
-    int year = 2020 + (*(p_tmp + 1) >> 4)%16;
-    int month= (*(p_tmp + 1) & 0x0F)%16;
-
-    BTHWDBG("BT Controller model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x", chip_name,year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
-    sprintf(local_ver, "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
-
-    if (property_set(VENDOR_AMLBTVER_PROPERTY, (char *)local_ver) < 0)
+    if (cnt == 0)
     {
-        ALOGE("%s:Failed to set amlbt version in %s", __func__, VENDOR_AMLBTVER_PROPERTY);
+        property_get("persist.vendor.bt_name", chip_name, "unknown");
+        int year = 2020 + (*(p_tmp + 1) >> 4)%16;
+        int month= (*(p_tmp + 1) & 0x0F)%16;
+
+        BTHWDBG("BT Controller model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x", chip_name,year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
+        sprintf(local_ver, "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
+
+        if (property_set(VENDOR_AMLBTVER_PROPERTY, (char *)local_ver) < 0)
+        {
+            ALOGE("%s:Failed to set amlbt version in %s", __func__, VENDOR_AMLBTVER_PROPERTY);
+        }
     }
+
     UINT16_TO_STREAM(p, HCI_VSC_WAKE_WRITE_DATA);
-    *p++ = APCF_config_manf_data[0];
-    for (i = 1; i < (int)sizeof(APCF_config_manf_data); i++)
-        *p++ = APCF_config_manf_data[i];
-    p_buf->len = HCI_CMD_PREAMBLE_SIZE + APCF_config_manf_data[0];
-    hw_cfg_cb.state = HW_CFG_SET_MANU_DATA;
-    if (amlbt_transtype.family_id == AML_W2)
+    if (amlbt_manf_cnt > 0)
     {
-        hw_cfg_cb.state = HW_CFG_SET_BD_GOOGLE_ADDR;
+        for (; cnt < strlen(APCF_config_manf_data)/amlbt_manf_cnt; cnt++)
+            *p++ = APCF_config_manf_data[cnt];
     }
-    else
+    amlbt_manf_cnt--;
+    p_buf->len = HCI_CMD_PREAMBLE_SIZE + 6;
+    if (amlbt_transtype.family_id == AML_W1)
     {
+        cnt = 0;
         hw_cfg_cb.state = HW_CFG_SET_MANU_DATA;
         ALOGD("vendor lib fwcfg completed");
         ALOGD("vendor lib config manf data");
+    }
+    else
+    {
+        if (amlbt_manf_cnt <= 0)
+        {
+            cnt = 0;
+            hw_cfg_cb.state = HW_CFG_SET_MANU_DATA;
+            ALOGD("vendor lib fwcfg completed");
+            ALOGD("vendor lib config manf data");
+        }
     }
     //Set ADV parameter of remote controller using to wake up device when suspend
     is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_WAKE_WRITE_DATA, p_buf, hw_config_cback);
