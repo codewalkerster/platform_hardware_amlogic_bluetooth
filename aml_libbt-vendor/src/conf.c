@@ -72,8 +72,6 @@ unsigned int amlbt_pin_mux = 0;
 unsigned int amlbt_br_digit_gain = 0;
 unsigned int amlbt_edr_digit_gain = 0;
 unsigned int amlbt_fwlog_config = 0;
-unsigned int amlbt_manf_cnt = 0;
-unsigned char APCF_config_manf_data[256] = {'\0'};
 
 /******************************************************************************
 **  Static variables
@@ -177,36 +175,9 @@ static char *aml_trim(char *str) {
     return str;
 }
 
-void manf_data_split(char*p)
-{
-    int tmp = 0;
-    int i=0,j=0;
-
-    while (i < strlen(p))
-    {
-        sscanf(p + i, "%2x", &tmp);
-        //ALOGD("%#02x", tmp);
-        if (tmp < 0 || tmp > 0xff)
-        {
-            ALOGE("%#02x", tmp);
-            return;
-        }
-        APCF_config_manf_data[j++] = *((unsigned char*)&tmp);
-
-        if (isspace(*(p+2+i)))
-        {
-            i += 3;
-        }
-        else
-        {
-            i += 2;
-        }
-    }
-}
 
 void load_aml_stack_conf()
 {
-    char *str;
     char *split;
     FILE *fp = fopen(AML_VENDOR_LIB_CONF_FILE, "rt");
     if (!fp) {
@@ -276,20 +247,6 @@ void load_aml_stack_conf()
         else if (!strcmp(aml_trim(line_f), "Btfwlog")) {
             amlbt_fwlog_config = strtol(aml_trim(split+1), &endptr, 0);
             ALOGE("%s amlbt_edr_digit_gain '%#x'", __func__, amlbt_fwlog_config);
-        }
-        else if (!strcmp(aml_trim(line_f), "ManfData")) {
-            str = aml_trim(split+1);
-            ALOGE("%s manfdata '%s' len %d", __func__, str, strlen(str));
-            if (strlen(str) < 2)
-            {
-                ALOGE("%s manfdata error", __func__);
-            }
-            else
-            {
-                manf_data_split(str);
-            }
-            amlbt_manf_cnt = strlen(APCF_config_manf_data)/6;
-            ALOGE("%s manfdata cnt %d strlen %d", __func__, amlbt_manf_cnt, strlen(APCF_config_manf_data));
         }
     }
     fclose(fp);
