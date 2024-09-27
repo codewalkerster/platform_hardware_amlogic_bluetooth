@@ -1615,7 +1615,7 @@ static int op(bt_vendor_opcode_t opcode, void *param)
             }
             if (!recovery_flag)
             {
-                if ((amlbt_transtype.family_id > AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
+                if ((amlbt_transtype.family_id >= AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
                     && hw_cfg_cb.state == 0)
                 {
                     property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
