@@ -5,7 +5,7 @@ ifneq ($(BOARD_HAVE_BLUETOOTH_AMLOGIC),)
 include $(CLEAR_VARS)
 
 # androidT and above use packages/modules/Bluetooth/system path
-ifeq ($(filter-out 33 34 35, $(strip $(PLATFORM_SDK_VERSION))), )
+ifeq ($(filter-out 33 34, $(strip $(PLATFORM_SDK_VERSION))), )
 BDROID_DIR := $(TOP_DIR)packages/modules/Bluetooth/system
 else
 BDROID_DIR := $(TOP_DIR)system/bt

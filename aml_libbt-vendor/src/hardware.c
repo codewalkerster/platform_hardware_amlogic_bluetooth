@@ -1156,7 +1156,7 @@ void hw_stop_recovery(void)
     }
 }
 
-static void hw_start_recovery_handle(union sigval param)
+static void hw_start_recovery_handle(int param)
 {
     BTHWDBG("---------hw_start_recovery_handle %d--------", fw_alive);
 
