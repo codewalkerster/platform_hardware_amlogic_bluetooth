@@ -284,7 +284,6 @@ enum
     HW_CFG_AML_DOWNLOAD_FIRMWARE_STRAT_CPU_UART,    //0xb
     HW_CFG_SET_PARAMS,      //0xc
     HW_CFG_SET_BD_ADDR,     //0xd
-    HW_CFG_SET_BD_GOOGLE_ADDR,    //w2 used
     HW_CFG_AML_POWER_END,   //0xe
     HW_CFG_SET_MANU_DATA,   //0xf
     HW_CFG_START,       //0x10
@@ -343,7 +342,6 @@ uint8_t hw_cfg_download_firmware_start_cpu_uart_before(void *p_mem, HC_BT_HDR *p
 uint8_t hw_cfg_download_firmware_start_cpu_uart(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_set_params(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_set_bd_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
-uint8_t hw_cfg_set_bd_google_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_bt_power_end(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t wole_config_write_manufacture(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_start(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
@@ -378,7 +376,6 @@ uint8_t (*hw_config_func[])(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p) =
     hw_cfg_download_firmware_start_cpu_uart,    //0xb
     hw_cfg_set_params,      //0xc
     hw_cfg_set_bd_addr,     //0xd
-    hw_cfg_set_bd_google_addr,    //0xe w2 used
     hw_cfg_bt_power_end,   //0xe
     wole_config_write_manufacture,    //0xf
     hw_cfg_start,       //0x10
@@ -2163,37 +2160,12 @@ uint8_t hw_cfg_set_bd_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
     for (i = 1; i < (int)sizeof(APCF_config_manf_data); i++)
         *p++ = APCF_config_manf_data[i];
     p_buf->len = HCI_CMD_PREAMBLE_SIZE + APCF_config_manf_data[0];
-    hw_cfg_cb.state = HW_CFG_SET_BD_GOOGLE_ADDR;
-    //Set ADV parameter of remote controller using to wake up device when suspend
-    is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_WAKE_WRITE_DATA, p_buf, hw_config_cback);
-
-    return is_proceeding;
-}
-
-uint8_t hw_cfg_set_bd_google_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
-{
-    int i;
-    uint8_t is_proceeding = FALSE;
-
-    //uint8_t APCF_config_manf_data[] = {0x05, 0x19, 0xff,0x01, 0x0a,0xb}; //public version
-    //uint8_t APCF_config_manf_data[] = {0x05, 0x25, 0xfe, 0x00, 0x00, 0x01}; //xiaomi
-    uint8_t APCF_config_manf_data[] = {0x05, 0x13, 0x16, 0x01, 0x04, 0x06}; //google
-
-    UINT16_TO_STREAM(p, HCI_VSC_WAKE_WRITE_DATA);
-    *p++ = APCF_config_manf_data[0];
-    for (i = 1; i < (int)sizeof(APCF_config_manf_data); i++)
-        *p++ = APCF_config_manf_data[i];
-    p_buf->len = HCI_CMD_PREAMBLE_SIZE + APCF_config_manf_data[0];
     hw_cfg_cb.state = HW_CFG_SET_MANU_DATA;
     //Set ADV parameter of remote controller using to wake up device when suspend
     is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_WAKE_WRITE_DATA, p_buf, hw_config_cback);
-    BTHWDBG("HW_CFG_SET_BD_GOOGLE_ADDR");
-    ALOGD("vendor lib fwcfg completed");
-    ALOGD("vendor lib config manf data");
 
     return is_proceeding;
 }
-
 
 uint8_t wole_config_write_manufacture(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
 {
