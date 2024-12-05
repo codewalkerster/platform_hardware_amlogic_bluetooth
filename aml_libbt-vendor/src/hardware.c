@@ -2163,14 +2163,7 @@ uint8_t hw_cfg_set_bd_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
     for (i = 1; i < (int)sizeof(APCF_config_manf_data); i++)
         *p++ = APCF_config_manf_data[i];
     p_buf->len = HCI_CMD_PREAMBLE_SIZE + APCF_config_manf_data[0];
-    if (amlbt_transtype.family_id == AML_W1U || amlbt_transtype.family_id == AML_W2)
-    {
-        hw_cfg_cb.state = HW_CFG_SET_BD_GOOGLE_ADDR;
-    }
-    else
-    {
-        hw_cfg_cb.state = HW_CFG_SET_MANU_DATA;
-    }
+    hw_cfg_cb.state = HW_CFG_SET_BD_GOOGLE_ADDR;
     //Set ADV parameter of remote controller using to wake up device when suspend
     is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_WAKE_WRITE_DATA, p_buf, hw_config_cback);
 
