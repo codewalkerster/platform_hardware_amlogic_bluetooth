@@ -1647,6 +1647,13 @@ static int op(bt_vendor_opcode_t opcode, void *param)
                     ALOGD("w1 amlbt shutdown");
                     aml_woble_configure(g_userial_fd);
                 }
+                else
+                {
+                    ALOGD("w1 close reset bt");
+                    usleep(100000);
+                    aml_reset_bt(g_userial_fd);
+                    usleep(100000);
+                }
             }
             if (!recovery_flag)
             {
