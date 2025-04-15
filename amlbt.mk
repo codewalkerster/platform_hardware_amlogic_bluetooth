@@ -40,14 +40,8 @@ PRODUCT_PACKAGES += \
   z_permit_open \
   z_permit_close \
   z_throughput_rx_end \
-  threadbr_aml \
-  udpServer \
-  libmnl.so \
-  libnetfilter_queue.so \
-  libnfnetlink.so \
-  libprotobuf-cpp-lite_aml.so \
-  thread_ncp_aml.so \
-  thread_otbr_aml.so
+  otbr-agent-aml \
+  ot-ctl-aml
 
 PRODUCT_COPY_FILES += frameworks/native/data/etc/android.hardware.bluetooth.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.bluetooth.xml \
        frameworks/native/data/etc/android.hardware.bluetooth_le.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.bluetooth_le.xml
