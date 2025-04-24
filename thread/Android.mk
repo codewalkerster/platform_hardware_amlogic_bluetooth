@@ -1,19 +1,25 @@
 LOCAL_PATH := $(call my-dir)
 
-ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 26 && echo OK),OK)
-LIB_PATH_32 := $(TARGET_OUT_VENDOR)/lib/
-LIB_PATH_64 := $(TARGET_OUT_VENDOR)/lib64/
-else
-LIB_PATH_32 := $(TARGET_OUT)/lib/
-LIB_PATH_64 := $(TARGET_OUT)/lib64/
-endif
+#ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 26 && echo OK),OK)
+#LIB_PATH_32 := $(TARGET_OUT_VENDOR)/lib/
+#LIB_PATH_64 := $(TARGET_OUT_VENDOR)/lib64/
+#else
+#LIB_PATH_32 := $(TARGET_OUT)/lib/
+#LIB_PATH_64 := $(TARGET_OUT)/lib64/
+#endif
 
 include $(CLEAR_VARS)
 LOCAL_SYSTEM_EXT_MODULE := true
-LOCAL_ALLOW_UNDEFINED_SYMBOLS := true
+#LOCAL_ALLOW_UNDEFINED_SYMBOLS := true
 #LOCAL_PROPRIETARY_MODULE := true
 LOCAL_MODULE := otbr-agent-aml
-LOCAL_SRC_FILES := otbr-agent-aml
+ifneq (,$(findstring 64,$(TARGET_ARCH)))
+LOCAL_SRC_FILES := 64bit/otbr-agent-aml
+$(info Building for 64-bit architecture otbr-agent-aml)
+else
+LOCAL_SRC_FILES := 32bit/otbr-agent-aml
+$(info Building for 32-bit architecture otbr-agent-aml)
+endif
 LOCAL_MODULE_CLASS := EXECUTABLES
 LOCAL_MODULE_SUFFIX :=
 LOCAL_MODULE_PATH  :=$(TARGET_OUT_SYSTEM_EXT)/bin
@@ -26,7 +32,13 @@ include $(CLEAR_VARS)
 LOCAL_SYSTEM_EXT_MODULE := true
 #LOCAL_PROPRIETARY_MODULE := true
 LOCAL_MODULE := ot-ctl-aml
-LOCAL_SRC_FILES := ot-ctl-aml
+ifneq (,$(findstring 64,$(TARGET_ARCH)))
+LOCAL_SRC_FILES := 64bit/ot-ctl-aml
+$(info Building for 64-bit architecture ot-ctl-aml)
+else
+LOCAL_SRC_FILES := 32bit/ot-ctl-aml
+$(info Building for 32-bit architecture ot-ctl-aml)
+endif
 LOCAL_MODULE_CLASS := EXECUTABLES
 LOCAL_MODULE_SUFFIX :=
 LOCAL_MODULE_PATH  :=$(TARGET_OUT_SYSTEM_EXT)/bin
