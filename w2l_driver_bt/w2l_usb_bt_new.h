@@ -1,14 +1,30 @@
 #ifndef __W2L_USB_BT_NEW_H__
 #define __W2L_USB_BT_NEW_H__
 
+#define HCI_TYPE_ZIGBEE   0xfa
+#define HCI_TYPE_THREAD   0xfa
+
+#define AML_W2LU_MAX_COEX_DEVICES   4
+
 typedef struct
 {
-    struct cdev dev_cdev;
+    struct cdev dev_cdev[AML_W2LU_MAX_COEX_DEVICES];
     int         dev_major;
     struct class *dev_class;
-    struct device *dev_device;
+    struct device *dev_device[AML_W2LU_MAX_COEX_DEVICES];
     struct early_suspend early_suspend;
-    unsigned char firmware_start;
+    unsigned char bt_start;
+    unsigned char zigbee_start;
+    unsigned char thread_start;
+    struct sk_buff_head tx_queue;
+    struct work_struct  write_work;
+    struct sk_buff_head bt_rx_queue;
+    struct sk_buff_head zigbee_rx_queue;
+    struct sk_buff_head thread_rx_queue;
+    wait_queue_head_t zigbee_wait_queue;
+    wait_queue_head_t thread_wait_queue;
+    unsigned int zigbee_rd_state;
+    unsigned int thread_rd_state;
     struct completion comp;
     const unsigned char *iccm_buf;
     const unsigned char *dccm_buf;
@@ -26,20 +42,12 @@ typedef struct
     gdsl_fifo_t *fw_type_fifo;
     gdsl_fifo_t *fw_evt_fifo;
     gdsl_fifo_t *fw_data_fifo;
-    unsigned char dr_type_fifo_buf[1024];
-    gdsl_fifo_t *dr_type_fifo;
-    unsigned char dr_evt_fifo_buf[8*1024];
-    gdsl_fifo_t *dr_evt_fifo;
-    unsigned char dr_data_fifo_buf[8*1024];
-    gdsl_fifo_t *dr_data_fifo;
     //tx fifo
     gdsl_fifo_t *tx_cmd_fifo;
     gdsl_tx_q_t tx_q[8]; //USB_TX_Q_NUM
     //15.4 fifo
-    gdsl_fifo_t *_15p4_dr_fifo;
     gdsl_fifo_t *_15p4_tx_fifo;
     gdsl_fifo_t *_15p4_rx_fifo;
-    unsigned char dr_15p4_buf[4*1024];
     //rc manfdata
     unsigned char rc_manfdata[6*8];
     unsigned int manfdata_len;
@@ -52,7 +60,6 @@ typedef struct
     struct urb *bt_urb;
     struct task_struct *usb_irq_task;
     struct semaphore usb_irq_sem;
-    struct semaphore sr_sem;
     unsigned char usb_irq_task_quit;
     wait_queue_head_t rd_wait_queue;
     struct wakeup_source *amlbt_wakeup_source;
@@ -64,6 +71,13 @@ typedef struct
     unsigned int input_key;
     struct input_dev *amlbt_input_dev;
     struct device_link *link;
+    //task
+    struct hrtimer poll_timer;
+    ktime_t ktime;
+    struct workqueue_struct *check_fw_wq;
+    struct work_struct check_fw;
+    //ktimer
+    u64 wait_start;
 } w2l_usb_bt_new_t;
 
 int amlbt_w2lu_new_init(void);

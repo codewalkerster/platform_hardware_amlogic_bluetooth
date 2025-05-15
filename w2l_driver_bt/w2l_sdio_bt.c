@@ -36,11 +36,22 @@
 #include <linux/of.h>
 #include <linux/of_gpio.h>
 #include <linux/version.h>
+#include <linux/tty.h>
+#include <linux/skbuff.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+#include <linux/unaligned/packed_struct.h>
+#else
+#include <asm/unaligned.h>
+#endif
+
 #include "common.h"
 #include "w2l_bt_entry.h"
 #include "w2l_sdio_bt.h"
 
 #define AML_BT_NOTE "stpbt"
+#define AML_ZIGBEE_NOTE                 "aml_zigbee"
+#define AML_THREAD_NOTE                 "aml_thread"
+#define AML_COEX_NOTE                   "aml_coex"
 
 #define AML_BT_FIRMWARE_NAME        "w2l_bt_15p4_fw_uart.bin"
 #define AML_BT_FIRMWARE_TXT_NAME    "w2l_bt_15p4_fw_uart.txt"
@@ -64,6 +75,7 @@
 #define REG_PMU_POWER_CFG       0xf03040
 #define REG_RAM_PD_SHUTDWONW_SW 0xf03050
 #define REG_FW_MODE             0xf000e0
+#define REG_FW_PC               0x200034
 
 #define BIT_PHY                 1
 #define BIT_MAC                 (1 << 1)
@@ -101,6 +113,9 @@
 #define RG_AON_A61                                (CHIP_INTF_REG_BASE + 0xf4)
 #define RG_AON_A62                                (CHIP_INTF_REG_BASE + 0xf8)
 
+#define W2L_DF_REG_A188                           (0x00f062f0)
+#define W2L_RG_PMU_A16                            (0x00f02040)
+
 // pmu status
 #define PMU_PWR_OFF       0x0
 #define PMU_PWR_XOSC      0x1
@@ -118,6 +133,12 @@
 extern struct aml_hif_sdio_ops g_hif_sdio_ops;
 extern struct aml_pm_type g_wifi_pm;
 extern unsigned char g_chip_function_ctrl;
+extern struct aml_bus_state_detect bus_state_detect;
+
+extern void aml_sdio_exit(void);
+extern int  aml_sdio_init(void);
+extern void aml_bus_state_detect_deinit(void);
+extern void extern_wifi_set_enable(int is_on);
 extern int register_bt_event_notifier(struct notifier_block *nb);
 extern int unregister_bt_event_notifier(struct notifier_block *nb);
 //extern unsigned char aml_wifi_detect_bt_status __attribute__((weak));
@@ -126,13 +147,14 @@ static w2l_sdio_bt_t sdio_bt = {0};
 //static void amlbt_shutdown_func(void);
 
 static int amlbt_sdio_probe(struct platform_device *dev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static int amlbt_sdio_remove(struct platform_device *dev);
+#else
+static void amlbt_sdio_remove(struct platform_device *dev);
+#endif
 static int amlbt_sdio_suspend(struct platform_device *dev, pm_message_t state);
 static int amlbt_sdio_resume(struct platform_device *dev);
 static void amlbt_sdio_shutdown(struct platform_device *dev);
-
-static int amlbt_sdio_fops_open(struct inode *inode, struct file *file);
-static int amlbt_sdio_fops_close(struct inode *inode, struct file *file);
 
 #ifdef CONFIG_COMPAT
 static long amlbt_sdio_compat_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
@@ -141,6 +163,29 @@ static long amlbt_sdio_ioctl(struct file* filp, unsigned int cmd, unsigned long 
 static int amlbt_sdio_download_firmware(w2l_sdio_bt_t *p_sdio);
 static void amlbt_wake_func(struct work_struct *work);
 
+static unsigned int amlbt_w2ls_bt_fops_poll(struct file *file, poll_table *wait);
+static int amlbt_w2ls_bt_fops_open(struct inode *inode, struct file *file);
+static int amlbt_w2ls_bt_fops_close(struct inode *inode, struct file *file);
+static ssize_t amlbt_w2ls_bt_fops_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p);
+static ssize_t amlbt_w2ls_bt_fops_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p);
+
+static unsigned int amlbt_w2ls_zigbee_fops_poll(struct file *file, poll_table *wait);
+static int amlbt_w2ls_zigbee_fops_open(struct inode *inode, struct file *file);
+static int amlbt_w2ls_zigbee_fops_close(struct inode *inode, struct file *file);
+static ssize_t amlbt_w2ls_zigbee_fops_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p);
+static ssize_t amlbt_w2ls_zigbee_fops_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p);
+
+static unsigned int amlbt_w2ls_thread_fops_poll(struct file *file, poll_table *wait);
+static int amlbt_w2ls_thread_fops_open(struct inode *inode, struct file *file);
+static int amlbt_w2ls_thread_fops_close(struct inode *inode, struct file *file);
+static ssize_t amlbt_w2ls_thread_fops_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p);
+static ssize_t amlbt_w2ls_thread_fops_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p);
+
+static int amlbt_w2ls_coex_fops_open(struct inode *inode, struct file *file);
+static int amlbt_w2ls_coex_fops_close(struct inode *inode, struct file *file);
+static int amlbt_w2ls_uart_tx_wakeup(struct hci_uart *hu);
+static struct tty_ldisc_ops amlbt_w2ls_uart_ldisc;
+static void amlbt_w2ls_exception_func(struct work_struct *work);
 
 static void amlbt_dev_release(struct device *dev)
 {
@@ -170,10 +215,52 @@ static struct platform_driver amlbt_sdio_driver =
     },
 };
 
-static const struct file_operations amlbt_sdio_fops =
+static const struct file_operations amlbt_w2ls_coex_bt_fops =
 {
-    .open       = amlbt_sdio_fops_open,
-    .release    = amlbt_sdio_fops_close,
+    .open       = amlbt_w2ls_bt_fops_open,
+    .release    = amlbt_w2ls_bt_fops_close,
+    .write      = amlbt_w2ls_bt_fops_write,
+    .read      = amlbt_w2ls_bt_fops_read,
+    .unlocked_ioctl = amlbt_sdio_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = amlbt_sdio_compat_ioctl,
+#endif
+    .poll       = amlbt_w2ls_bt_fops_poll,
+    .fasync     = NULL
+};
+
+static const struct file_operations amlbt_w2ls_coex_zigbee_fops =
+{
+    .open       = amlbt_w2ls_zigbee_fops_open,
+    .release    = amlbt_w2ls_zigbee_fops_close,
+    .write      = amlbt_w2ls_zigbee_fops_write,
+    .read      = amlbt_w2ls_zigbee_fops_read,
+    .unlocked_ioctl = amlbt_sdio_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = amlbt_sdio_compat_ioctl,
+#endif
+    .poll       = amlbt_w2ls_zigbee_fops_poll,
+    .fasync     = NULL
+};
+
+static const struct file_operations amlbt_w2ls_coex_thread_fops =
+{
+    .open       = amlbt_w2ls_thread_fops_open,
+    .release    = amlbt_w2ls_thread_fops_close,
+    .write      = amlbt_w2ls_thread_fops_write,
+    .read      = amlbt_w2ls_thread_fops_read,
+    .unlocked_ioctl = amlbt_sdio_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = amlbt_sdio_compat_ioctl,
+#endif
+    .poll       = amlbt_w2ls_thread_fops_poll,
+    .fasync     = NULL
+};
+
+static const struct file_operations amlbt_w2ls_coex_fops =
+{
+    .open       = amlbt_w2ls_coex_fops_open,
+    .release    = amlbt_w2ls_coex_fops_close,
     .write      = NULL,
     .read      = NULL,
     .unlocked_ioctl = amlbt_sdio_ioctl,
@@ -184,12 +271,15 @@ static const struct file_operations amlbt_sdio_fops =
     .fasync     = NULL
 };
 
+
 static void amlbt_sdio_res_deinit(w2l_sdio_bt_t *p_sdio)
 {
     BTI("%s p_sdio->irq %d\n", __func__, p_sdio->irq);
     p_sdio->irq = -1;
     p_sdio->irq_handle = 0;
-    p_sdio->firmware_start = 0;
+    p_sdio->bt_start = 0;
+    skb_queue_purge(&p_sdio->bt_tx_queue);
+    skb_queue_purge(&p_sdio->bt_rx_queue);
     BTI("%s finished \n", __func__);
 }
 
@@ -210,8 +300,48 @@ static int amlbt_sdio_res_init(w2l_sdio_bt_t *p_sdio)
     p_sdio->factory = 0;
     p_sdio->irq = -1;
     p_sdio->irq_handle = 0;
+    init_waitqueue_head(&p_sdio->bt_wait_queue);
+    skb_queue_head_init(&p_sdio->bt_tx_queue);
+    skb_queue_head_init(&p_sdio->bt_rx_queue);
     return 0;
 }
+
+static void amlbt_w2ls_coex_zigbee_res_deinit(w2l_sdio_bt_t *p_sdio)
+{
+    BTI("%s \n", __func__);
+    p_sdio->zigbee_start = 0;
+    skb_queue_purge(&p_sdio->zigbee_tx_queue);
+    skb_queue_purge(&p_sdio->zigbee_rx_queue);
+}
+
+static int amlbt_w2ls_coex_zigbee_res_init(w2l_sdio_bt_t *p_sdio)
+{
+    BTI("%s \n", __func__);
+    p_sdio->zigbee_start = 0;
+    init_waitqueue_head(&p_sdio->zigbee_wait_queue);
+    skb_queue_head_init(&p_sdio->zigbee_tx_queue);
+    skb_queue_head_init(&p_sdio->zigbee_rx_queue);
+    return 0;
+}
+
+static void amlbt_w2ls_coex_thread_res_deinit(w2l_sdio_bt_t *p_sdio)
+{
+    BTI("%s \n", __func__);
+    p_sdio->thread_start = 0;
+    skb_queue_purge(&p_sdio->thread_tx_queue);
+    skb_queue_purge(&p_sdio->thread_rx_queue);
+}
+
+static int amlbt_w2ls_coex_thread_res_init(w2l_sdio_bt_t *p_sdio)
+{
+    BTI("%s \n", __func__);
+    p_sdio->thread_start = 0;
+    init_waitqueue_head(&p_sdio->thread_wait_queue);
+    skb_queue_head_init(&p_sdio->thread_tx_queue);
+    skb_queue_head_init(&p_sdio->thread_rx_queue);
+    return 0;
+}
+
 
 #if 0
 static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
@@ -323,8 +453,8 @@ static int amlbt_input_device_init(struct platform_device *pdev)
     set_bit(EV_KEY,  p_sdio->input_dev->evbit);
     set_bit(KEY_POWER, p_sdio->input_dev->keybit);
 
-    p_sdio->input_dev->name = "input_btrcu";
-    p_sdio->input_dev->phys = "input_btrcu/input0";
+    p_sdio->input_dev->name = INPUT_NAME;
+    p_sdio->input_dev->phys = INPUT_PHYS;
     p_sdio->input_dev->dev.parent = &pdev->dev;
     p_sdio->input_dev->id.bustype = BUS_ISA;
     p_sdio->input_dev->id.vendor = 0x0001;
@@ -463,12 +593,15 @@ static void amlbt_shutdown_func(void)
 static int amlbt_sdio_create_device(w2l_sdio_bt_t *p_sdio)
 {
     int ret = 0;
+    int i = 0, j = 0;
     int cdevErr = 0;
-    dev_t dev;
+    dev_t dev = 0;
+    const char *device_names[AML_W2LS_MAX_COEX_DEVICES] =
+        { AML_BT_NOTE, AML_ZIGBEE_NOTE, AML_THREAD_NOTE, AML_COEX_NOTE };
 
     BTI("%s \n", __func__);
 
-    ret = alloc_chrdev_region(&dev, 0, 1, AML_BT_NOTE);
+    ret = alloc_chrdev_region(&dev, 0, AML_W2LS_MAX_COEX_DEVICES, AML_BT_NOTE);
     if (ret)
     {
         BTE("fail to allocate chrdev\n");
@@ -477,16 +610,55 @@ static int amlbt_sdio_create_device(w2l_sdio_bt_t *p_sdio)
 
     p_sdio->dev_major = MAJOR(dev);
     BTI("major number:%d\n", p_sdio->dev_major);
-    cdev_init(&p_sdio->dev_cdev, &amlbt_sdio_fops);
-    p_sdio->dev_cdev.owner = THIS_MODULE;
 
-    cdevErr = cdev_add(&p_sdio->dev_cdev, dev, 1);
+    i = 0;
+    //bt node
+    cdev_init(&p_sdio->dev_cdev[i], &amlbt_w2ls_coex_bt_fops);
+    p_sdio->dev_cdev[i].owner = THIS_MODULE;
+
+    cdevErr = cdev_add(&p_sdio->dev_cdev[i], MKDEV(p_sdio->dev_major, i), 1);
     if (cdevErr)
     {
-        goto error;
+        goto error_cdev;
     }
 
-    BTI("driver(major %d) installed.\n", p_sdio->dev_major);
+    i++;
+    //zigbee node
+    cdev_init(&p_sdio->dev_cdev[i], &amlbt_w2ls_coex_zigbee_fops);
+    p_sdio->dev_cdev[i].owner = THIS_MODULE;
+
+    ret = cdev_add(&p_sdio->dev_cdev[i], MKDEV(p_sdio->dev_major, i), 1);
+    if (ret)
+    {
+        BTE("cdev_add failed for minor %d\n", i);
+        goto error_cdev;
+    }
+
+    i++;
+    //thread node
+    cdev_init(&p_sdio->dev_cdev[i], &amlbt_w2ls_coex_thread_fops);
+    p_sdio->dev_cdev[i].owner = THIS_MODULE;
+
+    ret = cdev_add(&p_sdio->dev_cdev[i], MKDEV(p_sdio->dev_major, i), 1);
+    if (ret)
+    {
+        BTE("cdev_add failed for minor %d\n", i);
+        goto error_cdev;
+    }
+
+    i++;
+    //coex node
+    cdev_init(&p_sdio->dev_cdev[i], &amlbt_w2ls_coex_fops);
+    p_sdio->dev_cdev[i].owner = THIS_MODULE;
+
+    ret = cdev_add(&p_sdio->dev_cdev[i], MKDEV(p_sdio->dev_major, i), 1);
+    if (ret)
+    {
+        BTE("cdev_add failed for minor %d\n", i);
+        goto error_cdev;
+    }
+
+    BTI("driver (major %d) installed.\n", p_sdio->dev_major);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
     p_sdio->dev_class = class_create(THIS_MODULE, AML_BT_NOTE);
@@ -497,60 +669,74 @@ static int amlbt_sdio_create_device(w2l_sdio_bt_t *p_sdio)
     if (IS_ERR(p_sdio->dev_class))
     {
         BTE("class create fail, error code(%ld)\n", PTR_ERR(p_sdio->dev_class));
-        goto err1;
+        goto error_class;
     }
 
-    p_sdio->dev_device = device_create(p_sdio->dev_class, NULL, dev, NULL, AML_BT_NOTE);
-    if (IS_ERR(p_sdio->dev_device))
+    for (i = 0; i < AML_W2LS_MAX_COEX_DEVICES; i++)
     {
-        BTE("device create fail, error code(%ld)\n", PTR_ERR(p_sdio->dev_device));
-        goto err2;
+        p_sdio->dev_device[i] = device_create(p_sdio->dev_class, NULL, MKDEV(p_sdio->dev_major, i), NULL, device_names[i]);
+        if (IS_ERR(p_sdio->dev_device[i]))
+        {
+            BTE("device create fail for %s, error code(%ld)\n", device_names[i], PTR_ERR(p_sdio->dev_device[i]));
+            goto error_device;
+        }
     }
-    BTI("%s: BT_major %d\n", __func__, p_sdio->dev_major);
-    BTI("%s: dev id %d\n", __func__, dev);
+
+    BTI("Devices created success!\n");
 
     return 0;
 
-err2:
-    if (p_sdio->dev_class)
+error_device:
+    j = i;
+    while (--j >= 0)
     {
-        class_destroy(p_sdio->dev_class);
-        p_sdio->dev_class = NULL;
+        device_destroy(p_sdio->dev_class, MKDEV(p_sdio->dev_major, j));
     }
+    class_destroy(p_sdio->dev_class);
 
-err1:
-
-error:
-    if (cdevErr == 0)
-        cdev_del(&p_sdio->dev_cdev);
-
-    if (ret == 0)
-        unregister_chrdev_region(dev, 1);
+error_class:
+    j = i;
+error_cdev:
+    while (--j >= 0)
+    {
+        cdev_del(&p_sdio->dev_cdev[j]);
+    }
+    unregister_chrdev_region(dev, AML_W2LS_MAX_COEX_DEVICES);
 
     return -1;
 }
 
 static int amlbt_sdio_destroy_device(w2l_sdio_bt_t *p_sdio)
 {
-    dev_t dev = MKDEV(p_sdio->dev_major, 0);
+    dev_t dev;
+    int i;
 
-    BTI("%s dev id %d\n", __func__, dev);
+    BTI("%s: Destroying devices\n", __func__);
 
-    if (p_sdio->dev_device)
+    for (i = 0; i < AML_W2LS_MAX_COEX_DEVICES; i++)
     {
-        device_destroy(p_sdio->dev_class, dev);
-        p_sdio->dev_device = NULL;
+        dev = MKDEV(p_sdio->dev_major, i);
+        if (p_sdio->dev_device[i])
+        {
+            device_destroy(p_sdio->dev_class, dev);
+            p_sdio->dev_device[i] = NULL;
+        }
     }
+
     if (p_sdio->dev_class)
     {
         class_destroy(p_sdio->dev_class);
         p_sdio->dev_class = NULL;
     }
-    cdev_del(&p_sdio->dev_cdev);
 
-    unregister_chrdev_region(dev, 1);
+    for (i = 0; i < AML_W2LS_MAX_COEX_DEVICES; i++)
+    {
+        cdev_del(&p_sdio->dev_cdev[i]);
+    }
 
-    BTI("%s driver removed.\n", AML_BT_NOTE);
+    unregister_chrdev_region(MKDEV(p_sdio->dev_major, 0), AML_W2LS_MAX_COEX_DEVICES);
+
+    BTI("%s: Driver removed.\n", AML_BT_NOTE);
     return 0;
 }
 
@@ -588,28 +774,80 @@ static void amlbt_unregister_early_suspend(struct platform_device *dev)
 }
 
 
+static unsigned int amlbt_w2l_sdio_is_wifi_alive(void)
+{
+    unsigned int reg = 0;
+
+    if (bus_state_detect.is_recy_ongoing)
+    {
+        BTI("wifi recovery ongoing! \n");
+        return 1;
+    }
+
+    //reg = amlbt_sdio_read_word(W2L_DF_REG_A188);
+    reg = amlbt_sdio_read_word(W2L_RG_PMU_A16);
+
+    if ((reg & BIT(30) || reg & BIT(31)))
+    {
+        //wifi alive
+        return 1;
+    }
+    else
+    {
+        //wifi not alive
+        return 0;
+    }
+}
+
 static int amlbt_sdio_probe(struct platform_device *dev)
 {
-    BTI("%s \n", __func__);
+    unsigned int alive = amlbt_w2l_sdio_is_wifi_alive();
 
-    //g_bt_shutdown_func = amlbt_shutdown_func;
+    if (alive)
+    {
+        BTI("wifi alive\n");
+    }
+    else
+    {
+        BTI("wifi not alive\n");
+        aml_sdio_init();
+    }
 
     return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static int amlbt_sdio_remove(struct platform_device *dev)
+#else
+static void amlbt_sdio_remove(struct platform_device *dev)
+#endif
 {
-    BTI("%s \n", __func__);
+    unsigned int alive = amlbt_w2l_sdio_is_wifi_alive();
 
+    if (alive)
+    {
+        BTI("wifi alive\n");
+    }
+    else
+    {
+        BTI("wifi not alive\n");
+        BTI("aml_bus_state_detect_deinit\n");
+        aml_bus_state_detect_deinit();
+        BTI("remove wifi sdio device\n");
+        aml_sdio_exit();
+    }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
     return 0;
+#endif
 }
 
 static int amlbt_sdio_suspend(struct platform_device *dev, pm_message_t state)
 {
-    unsigned int reg = 0;
+//    unsigned int reg = 0;
     w2l_sdio_bt_t *p_sdio = &sdio_bt;
-    if (p_sdio->firmware_start)
+    if (p_sdio->bt_start)
     {
+#if 0
         if (p_sdio->fw_log)
         {
             //close fw log
@@ -619,8 +857,7 @@ static int amlbt_sdio_suspend(struct platform_device *dev, pm_message_t state)
             BTI("close fw log write %#x\n", reg);
             amlbt_sdio_write_word(RG_AON_A59, reg);
         }
-        //amlbt_aon_addr_bit_set(RG_AON_A52, 26);//set suspend bit
-        //amlbt_aon_addr_bit_clr(RG_AON_A52, 25);//allow fw sleep
+#endif
         amlbt_aon_addr_bit_set(RG_AON_A24, 26);//set suspend bit
         amlbt_aon_addr_bit_clr(RG_AON_A24, 25);//allow fw sleep
         p_sdio->irq_handle = 0;
@@ -635,11 +872,11 @@ static int amlbt_sdio_resume(struct platform_device *dev)
     unsigned int reg = 0;
     w2l_sdio_bt_t *p_sdio = &sdio_bt;
 
-    if (p_sdio->firmware_start)
+    if (p_sdio->bt_start)
     {
         //wait usb bus ready
         BTI("g_wifi_pm.bus_suspend_cnt:%#x\n", g_wifi_pm.bus_suspend_cnt);
-
+#if 0
         if (p_sdio->fw_log)
         {
             //open fw log
@@ -649,7 +886,7 @@ static int amlbt_sdio_resume(struct platform_device *dev)
             BTI("open fw log write %#x\n", reg);
             amlbt_sdio_write_word(RG_AON_A59, reg);
         }
-
+#endif
         while (atomic_read(&g_wifi_pm.bus_suspend_cnt) != 0)
         {
             usleep_range(20000, 20000);
@@ -662,7 +899,6 @@ static int amlbt_sdio_resume(struct platform_device *dev)
         }
         wait_cnt = 0;
         //forbid fw sleep
-        //amlbt_aon_addr_bit_set(RG_AON_A52, 25);
         amlbt_aon_addr_bit_set(RG_AON_A24, 25);
 
         // wake bt fw
@@ -677,10 +913,9 @@ static int amlbt_sdio_resume(struct platform_device *dev)
             BTI("Write RG_BT_PMU_A16:%#x\n", reg);
             amlbt_sdio_write_word(RG_BT_PMU_A16, reg);
             reg = amlbt_sdio_read_word(RG_BT_PMU_A16);
+            BTI("Read RG_BT_PMU_A16:%#x\n", reg);
         }
         // wait bt fw wake done
-        //fw will clear bit after wake done
-        //while (amlbt_aon_addr_bit_get(RG_AON_A55, 29))
         while (amlbt_aon_addr_bit_get(RG_AON_A17, 29))
         {
             usleep_range(20000, 20000);
@@ -702,10 +937,11 @@ static int amlbt_sdio_resume(struct platform_device *dev)
 
 static void amlbt_sdio_shutdown(struct platform_device *dev)
 {
-    w2l_sdio_bt_t *p_sdio = &sdio_bt;
-    unsigned int reg = 0;
+//    w2l_sdio_bt_t *p_sdio = &sdio_bt;
+//    unsigned int reg = 0;
 
     BTI("%s \n", __func__);
+#if 0
     if (p_sdio->fw_log)
     {
         //close fw log
@@ -715,7 +951,7 @@ static void amlbt_sdio_shutdown(struct platform_device *dev)
         BTI("close fw log write %#x\n", reg);
         amlbt_sdio_write_word(RG_AON_A59, reg);
     }
-
+#endif
     amlbt_sdio_write_word(RG_BT_PMU_A16, 0);
 }
 
@@ -738,7 +974,7 @@ static int amlbt_load_conf(w2l_sdio_bt_t *p_bt)
     size_t len, pos = 0;
 
     BTI("Firmware load:%s\n", AML_BT_CONFIG_NAME);
-    ret = request_firmware(&fw_entry, AML_BT_CONFIG_NAME, p_bt->dev_device);
+    ret = request_firmware(&fw_entry, AML_BT_CONFIG_NAME, p_bt->dev_device[0]);
     if (ret)
     {
         BTE("%s:%d Failed to load config file: %d\n", __func__, __LINE__, ret);
@@ -874,7 +1110,7 @@ static int amlbt_load_firmware(w2l_sdio_bt_t *p_bt)
     reg = (p_bt->fw_log & 0x3);
     amlbt_sdio_write_word(RG_AON_A59, reg);
     amlbt_sdio_write_word(REG_DEV_RESET, 0);
-    p_bt->firmware_start = 1;
+    p_bt->bt_start = 1;
     p_bt->iccm_buf = NULL;
     p_bt->dccm_buf = NULL;
     kfree(firmware_data);
@@ -890,7 +1126,7 @@ static int amlbt_load_firmware(w2l_sdio_bt_t *p_bt)
     unsigned int dccm_size;
 
     BTI("Firmware load:%s\n", AML_BT_FIRMWARE_NAME);
-    ret = request_firmware(&fw_entry, AML_BT_FIRMWARE_NAME, p_bt->dev_device);
+    ret = request_firmware(&fw_entry, AML_BT_FIRMWARE_NAME, p_bt->dev_device[0]);
     if (ret)
     {
         BTE("%s:%d Failed to load firmware: %d\n", __func__, __LINE__, ret);
@@ -919,12 +1155,21 @@ static int amlbt_load_firmware(w2l_sdio_bt_t *p_bt)
         BTE("Download firmware failed!!\n");
         return ret;
     }
-    amlbt_sdio_write_word(REG_FW_MODE, p_bt->fw_mode);
-    amlbt_sdio_write_word(REG_PMU_POWER_CFG, (p_bt->antenna << BIT_RF_NUM)|(p_bt->bt_sink << BT_SINK_MODE));
-    reg = ((p_bt->pin_mux << 20) | (p_bt->factory << 21));
+    reg = amlbt_sdio_read_word(REG_FW_MODE);
+    reg |= (p_bt->fw_mode & 0x3);
+    amlbt_sdio_write_word(REG_FW_MODE, reg);
+
+    reg = amlbt_sdio_read_word(REG_PMU_POWER_CFG);
+    reg |= ((p_bt->antenna << BIT_RF_NUM)|(p_bt->bt_sink << BT_SINK_MODE));
+    amlbt_sdio_write_word(REG_PMU_POWER_CFG, reg);
+
+    reg = amlbt_sdio_read_word(RG_AON_A53);
+    reg |= ((p_bt->pin_mux << 20) | (p_bt->factory << 21));
     reg |= (((p_bt->edr_digit_gain & 0xff) << 8) | (p_bt->br_digit_gain & 0xff));
     amlbt_sdio_write_word(RG_AON_A53, reg);
-    reg = (p_bt->fw_log & 0x3);
+
+    reg = amlbt_sdio_read_word(RG_AON_A59);
+    reg |= (p_bt->fw_log & 0x3);
     amlbt_sdio_write_word(RG_AON_A59, reg);
     amlbt_sdio_write_word(REG_DEV_RESET, 0);
     BTI("start bt cpu ok!\n");
@@ -934,13 +1179,14 @@ static int amlbt_load_firmware(w2l_sdio_bt_t *p_bt)
     BTI("pc2:%#x\n", amlbt_sdio_read_word(0x200034));
     usleep_range(10000, 10000);
     BTI("pc3:%#x\n", amlbt_sdio_read_word(0x200034));
-    p_bt->firmware_start = 1;
+    //p_bt->bt_start = 1;
     p_bt->iccm_buf = NULL;
     p_bt->dccm_buf = NULL;
     return 0;
 }
 #endif
 
+#if 0
 static int bt_event_handler(struct notifier_block *nb, unsigned long event, void *data)
 {
     reinit_completion(&sdio_bt.notify_comp);
@@ -953,60 +1199,94 @@ static int bt_event_handler(struct notifier_block *nb, unsigned long event, void
     complete(&sdio_bt.notify_comp);
     return NOTIFY_OK;
 }
+#else
+static int bt_event_handler(struct notifier_block *nb, unsigned long event, void *data)
+{
+    w2l_sdio_bt_t *p_sdio = &sdio_bt;
+    struct sk_buff      *skb;
+    unsigned char bt_hw_error[5] = {0x04, 0x10, 0x01, 0x00, 0x00};
+    unsigned char zigbee_hw_error[8] = {0x10, 0xfa, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00};
+    unsigned char thread_hw_error[8] = {0x10, 0xfa, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00};
+
+    BTF("Consumer received BT event: %lu, [%#x,%#x,%#x]\n", event,
+        p_sdio->bt_start, p_sdio->zigbee_start, p_sdio->thread_start);
+    if (p_sdio->bt_start || p_sdio->zigbee_start || p_sdio->thread_start)
+    {
+        if (p_sdio->bt_start)
+        {
+            reinit_completion(&p_sdio->notify_comp);
+            p_sdio->notify_trig = 1;
+            skb_queue_purge(&p_sdio->bt_tx_queue);
+            skb_queue_purge(&p_sdio->bt_rx_queue);
+        }
+        if (p_sdio->zigbee_start)
+        {
+            skb_queue_purge(&p_sdio->zigbee_tx_queue);
+            skb_queue_purge(&p_sdio->zigbee_rx_queue);
+        }
+        if (p_sdio->thread_start)
+        {
+            skb_queue_purge(&p_sdio->thread_tx_queue);
+            skb_queue_purge(&p_sdio->thread_rx_queue);
+        }
+
+        //amlbt_aon_addr_bit_set(RG_AON_A55, 29);
+        amlbt_load_firmware(&sdio_bt);
+
+        if (p_sdio->bt_start)
+        {
+            skb = alloc_skb(sizeof(bt_hw_error), GFP_ATOMIC);
+            if (!skb)
+            {
+                BTF("bt skb error!!\n");
+                return  NOTIFY_OK;
+            }
+            skb_put_data(skb, bt_hw_error, sizeof(bt_hw_error));
+            BTF("Report bt hw error!\n");
+            skb_queue_tail(&p_sdio->bt_rx_queue, skb);
+            wake_up_interruptible(&p_sdio->bt_wait_queue);
+        }
+
+        if (p_sdio->zigbee_start)
+        {
+            skb = alloc_skb(sizeof(zigbee_hw_error), GFP_ATOMIC);
+            if (!skb)
+            {
+                BTF("zigbee skb error!!\n");
+                return NOTIFY_OK;
+            }
+            skb_put_data(skb, zigbee_hw_error, sizeof(zigbee_hw_error));
+            BTF("Report zigbee hw error!\n");
+            skb_queue_tail(&p_sdio->zigbee_rx_queue, skb);
+            wake_up_interruptible(&p_sdio->zigbee_wait_queue);
+        }
+
+        if (p_sdio->thread_start)
+        {
+            skb = alloc_skb(sizeof(thread_hw_error), GFP_ATOMIC);
+            if (!skb)
+            {
+                BTF("thread skb error!!\n");
+                return NOTIFY_OK;
+            }
+            skb_put_data(skb, thread_hw_error, sizeof(thread_hw_error));
+            BTF("Report thread hw error!\n");
+            skb_queue_tail(&p_sdio->thread_rx_queue, skb);
+            wake_up_interruptible(&p_sdio->thread_wait_queue);
+        }
+    }
+    BTF("Coex driver excepion finish!\n");
+    if (p_sdio->bt_start)
+    {
+        complete(&p_sdio->notify_comp);
+    }
+    return NOTIFY_OK;
+}
+#endif
 
 static struct notifier_block bt_nb = {
     .notifier_call = bt_event_handler,
 };
-
-static int amlbt_sdio_fops_open(struct inode *inode, struct file *file)
-{
-    int ret = 0;
-
-    BTI("%s, version:%s \n", __func__, AML_W2LS_VERSION);
-    if (amlbt_sdio_res_init(&sdio_bt) != 0)
-    {
-        BTI("amlbt_sdio_res_init failed!\n");
-        goto exit;
-    }
-    file->private_data = &sdio_bt;
-    amlbt_load_conf(&sdio_bt);
-    ret = amlbt_load_firmware(&sdio_bt);
-    if (ret != 0)
-    {
-        BTI("amlbt_load_firmware failed!\n");
-        amlbt_sdio_res_deinit(&sdio_bt);
-        goto exit;
-    }
-    amlbt_register_interrupt_gpio(&sdio_bt);
-    register_bt_event_notifier(&bt_nb);
-exit:
-    return nonseekable_open(inode, file);
-}
-
-static int amlbt_sdio_fops_close(struct inode *inode, struct file *file)
-{
-    BTI("%s, %#x version:%s \n", __func__, sdio_bt.firmware_start, AML_W2LS_VERSION);
-
-    if (sdio_bt.firmware_start)
-    {
-        unregister_bt_event_notifier(&bt_nb);
-        if (sdio_bt.notify_trig)
-        {
-            if (!completion_done(&sdio_bt.notify_comp))
-            {
-                BTI("Waiting for exception task to finish...\n");
-                wait_for_completion(&sdio_bt.notify_comp);
-            }
-        }
-        //amlbt_aon_addr_bit_clr(RG_AON_A52, 26);
-        amlbt_aon_addr_bit_clr(RG_AON_A24, 26);
-        usleep_range(50000, 50000);
-        amlbt_unregister_interrupt_gpio(&sdio_bt);
-        amlbt_sdio_res_deinit(&sdio_bt);
-        amlbt_sdio_write_word(RG_AON_A15, 0);
-    }
-    return 0;
-}
 
 static int amlbt_sdio_download_firmware(w2l_sdio_bt_t *p_sdio)
 {
@@ -1118,6 +1398,9 @@ error:
 
 static long amlbt_sdio_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
 {
+    unsigned char coex_running = 0;
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)filp->private_data;
+
     BTI("arg value %ld", arg);
     BTI("cmd type=%c\t nr=%d\t dir=%d\t size=%d\n", _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_DIR(cmd), _IOC_SIZE(cmd));
     BTI("cmd value %ld", cmd);
@@ -1131,6 +1414,17 @@ static long amlbt_sdio_ioctl(struct file* filp, unsigned int cmd, unsigned long 
                 return -EFAULT;
             }
             BTI("IOCTL_GET_DEVICE_PID %#x\n", g_chip_function_ctrl);
+        }
+        break;
+        case IOCTL_GET_COEX_STATUS:
+        {
+            coex_running = ((p_bt->thread_start << 2) | (p_bt->zigbee_start << 1) | p_bt->bt_start);
+            if (copy_to_user((unsigned char __user *)arg, &coex_running, sizeof(unsigned char)) != 0)
+            {
+                BTE("IOCTL_GET_COEX_STATUS copy error\n");
+                return -EFAULT;
+            }
+            BTI("IOCTL_GET_COEX_STATUS %#x\n", coex_running);
         }
         break;
     }
@@ -1156,6 +1450,17 @@ int amlbt_w2ls_init(void)
 
     BTI("%s, version:%s", __func__, AML_W2LS_VERSION);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
+    ret = tty_register_ldisc(&amlbt_w2ls_uart_ldisc);
+#else
+    ret = tty_register_ldisc(N_HCI, &amlbt_w2ls_uart_ldisc);
+
+#endif
+    if (ret) {
+        dev_err(&p_device->dev, "platform_driver_register failed!\n");
+        return ret;
+    }
+
     ret = platform_driver_register(p_driver);
     if (ret) {
         dev_err(&p_device->dev, "platform_driver_register failed!\n");
@@ -1173,6 +1478,9 @@ int amlbt_w2ls_init(void)
     amlbt_register_early_suspend(p_device);
     amlbt_input_device_init(p_device);
 
+    register_bt_event_notifier(&bt_nb);
+    INIT_WORK(&sdio_bt.exception_work, amlbt_w2ls_exception_func);
+
     return 0;
 }
 
@@ -1186,6 +1494,8 @@ void amlbt_w2ls_exit(void)
 
     g_bt_shutdown_func = NULL;
 
+    unregister_bt_event_notifier(&bt_nb);
+
     amlbt_input_device_deinit();
     amlbt_unregister_early_suspend(p_device);
     amlbt_sdio_destroy_device(&sdio_bt);
@@ -1194,4 +1504,1141 @@ void amlbt_w2ls_exit(void)
     platform_driver_unregister(p_driver);
 }
 
+static unsigned int amlbt_w2ls_coex_is_running(w2l_sdio_bt_t *p_bt)
+{
+    BTI("%s, %#x, %#x, %#x\n", __func__, sdio_bt.bt_start, sdio_bt.zigbee_start, sdio_bt.thread_start);
+
+    if (p_bt->bt_start || p_bt->zigbee_start || p_bt->thread_start)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*--------------------------------------------------bt node------------------------------------------------------*/
+
+static unsigned int amlbt_w2ls_bt_fops_poll(struct file *file, poll_table *wait)
+{
+    int mask = 0;
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file->private_data;
+
+    poll_wait(file, &p_bt->bt_wait_queue, wait);
+
+    if (!p_bt->bt_start)
+    {
+        goto exit;
+    }
+
+    if (p_bt->bt_rd_state || skb_queue_len(&p_bt->bt_rx_queue) > 0)
+    {
+        mask |= POLLIN | POLLRDNORM;
+    }
+
+exit:
+    return mask;
+}
+
+static void amlbt_show_fw_debug_info(void)
+{
+    unsigned int value = 0;
+    BTI("PMU 0x00f03040:%#x \n", amlbt_sdio_read_word(REG_PMU_POWER_CFG));
+    usleep_range(10000, 10000);
+    value = amlbt_sdio_read_word(REG_FW_PC);
+    value = (value >> 6);
+    BTI("pc1 0x200034:%#x\n", value);
+    usleep_range(10000, 10000);
+    value = amlbt_sdio_read_word(REG_FW_PC);
+    value = (value >> 6);
+    BTI("pc2 0x200034:%#x\n", value);
+    usleep_range(10000, 10000);
+    value = amlbt_sdio_read_word(REG_FW_PC);
+    value = (value >> 6);
+    BTI("pc3 0x200034:%#x\n", value);
+}
+
+static int amlbt_w2ls_bt_fops_open(struct inode *inode, struct file *file)
+{
+    int ret = 0;
+
+    BTI("%s, %d, version:%s \n", __func__, sdio_bt.bt_start, AML_W2LS_VERSION);
+
+    if (amlbt_sdio_res_init(&sdio_bt) != 0)
+    {
+        BTI("amlbt_sdio_res_init failed!\n");
+        goto exit;
+    }
+    file->private_data = &sdio_bt;
+
+    if (!amlbt_w2ls_coex_is_running(&sdio_bt))
+    {
+        amlbt_load_conf(&sdio_bt);
+        ret = amlbt_load_firmware(&sdio_bt);
+        if (ret != 0)
+        {
+            BTI("amlbt_load_firmware failed!\n");
+            amlbt_sdio_res_deinit(&sdio_bt);
+            goto exit;
+        }
+    }
+    sdio_bt.bt_start = 1;
+    amlbt_register_interrupt_gpio(&sdio_bt);
+    //register_bt_event_notifier(&bt_nb);
+exit:
+    return nonseekable_open(inode, file);
+}
+
+static ssize_t amlbt_w2ls_bt_fops_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p)
+{
+    struct sk_buff *skb;
+    static unsigned char w_type = 0;
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file_p->private_data;
+    unsigned char *p;
+
+    if (!p_bt->bt_start)
+    {
+        BTE("%s:%d p_bt->bt_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    if (p_bt->hu == NULL)
+    {
+        BTE("%s:%d p_bt->hu == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    if (count == 1) //host write hci type
+    {
+        get_user(w_type, buf_p);
+        //BTI("bt write type %#x \n", w_type);
+    }
+    else
+    {
+        skb = alloc_skb(count+1, GFP_KERNEL);
+        if (!skb)
+        {
+            return -ENOMEM;
+        }
+        p = skb->data;
+        *(unsigned char *)skb_put(skb, 1) = w_type;
+
+        if (copy_from_user(skb_put(skb, count), buf_p, count))
+        {
+            kfree_skb(skb);
+            return -EFAULT;
+        }
+        skb_queue_tail(&p_bt->hu->tx_queue, skb);
+        //BTI("bt write %d, [%#x,%#x,%#x,%#x] \n", count, p[0], p[1], p[2], p[3]);
+        amlbt_w2ls_uart_tx_wakeup(p_bt->hu);
+    }
+
+    return count;
+}
+
+static ssize_t amlbt_w2ls_bt_fops_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p)
+{
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file_p->private_data;
+    static struct sk_buff *skb;
+
+    if (!p_bt->bt_start)
+    {
+        BTE("%s:%d p_bt->bt_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    //BTI("bt read %#x\n", p_bt->bt_rd_state);
+
+    switch (p_bt->bt_rd_state)
+    {
+        case HCI_RX_TYPE:
+        {
+            skb = skb_dequeue(&p_bt->bt_rx_queue);
+            if (!skb)
+            {
+                BTE("bt HCI_RX_TYPE no data!\n");
+                return 0;
+            }
+
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->bt_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            //BTI("bt read type %#x, %d\n", skb->data[0], skb->len);
+            skb_pull(skb, count);
+            p_bt->bt_rd_state = HCI_RX_HEADER;
+        }
+        break;
+        case HCI_RX_HEADER:
+        {
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->bt_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            //BTI("bt read header %d, %#x, %#x\n", count, skb->data[0], skb->data[1]);
+            skb_pull(skb, count);
+            if (skb->len == 0)
+            {
+                kfree_skb(skb);
+                p_bt->bt_rd_state = HCI_RX_TYPE;
+            }
+            else
+            {
+                p_bt->bt_rd_state = HCI_RX_PAYLOAD;
+            }
+        }
+        break;
+        case HCI_RX_PAYLOAD:
+        {
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->bt_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            //BTI("bt read payload %d, %#x, %#x\n", count, skb->data[0], skb->data[1]);
+            kfree_skb(skb);
+            p_bt->bt_rd_state = HCI_RX_TYPE;
+        }
+        break;
+
+    }
+    return count;
+}
+
+static int amlbt_w2ls_bt_fops_close(struct inode *inode, struct file *file)
+{
+    BTI("%s, %#x version:%s \n", __func__, sdio_bt.bt_start, AML_W2LS_VERSION);
+
+    if (sdio_bt.bt_start)
+    {
+        amlbt_show_fw_debug_info();
+        //unregister_bt_event_notifier(&bt_nb);
+        if (sdio_bt.notify_trig)
+        {
+            if (!completion_done(&sdio_bt.notify_comp))
+            {
+                BTI("Waiting for exception task to finish...\n");
+                wait_for_completion(&sdio_bt.notify_comp);
+            }
+        }
+        //amlbt_aon_addr_bit_clr(RG_AON_A52, 26);
+        amlbt_aon_addr_bit_clr(RG_AON_A24, 26);//bug fix, WIRELESS-10963, Solve the problem that fw cannot run after downloading
+        usleep_range(50000, 50000);
+        amlbt_unregister_interrupt_gpio(&sdio_bt);
+        amlbt_sdio_res_deinit(&sdio_bt);
+        amlbt_sdio_write_word(RG_AON_A15, 0);
+    }
+
+    return 0;
+}
+
+/*--------------------------------------------------zigbee node------------------------------------------------------*/
+
+static unsigned int amlbt_w2ls_zigbee_fops_poll(struct file *file, poll_table *wait)
+{
+    int mask = 0;
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file->private_data;
+
+    poll_wait(file, &p_bt->zigbee_wait_queue, wait);
+
+    if (!p_bt->zigbee_start)
+    {
+        goto exit;
+    }
+
+    if (p_bt->zigbee_rd_state || skb_queue_len(&p_bt->zigbee_rx_queue) > 0)
+    {
+        mask |= POLLIN | POLLRDNORM;
+    }
+
+exit:
+    return mask;
+}
+
+
+static int amlbt_w2ls_zigbee_fops_open(struct inode *inode, struct file *file)
+{
+    int ret = 0;
+
+    BTI("%s, %d, version:%s \n", __func__, sdio_bt.zigbee_start, AML_W2LS_VERSION);
+
+    if (sdio_bt.zigbee_start)
+    {
+        BTE("zigbee open status error!\n");
+        return -EFAULT;
+    }
+
+    if (amlbt_w2ls_coex_zigbee_res_init(&sdio_bt) != 0)
+    {
+        BTI("amlbt_sdio_res_init failed!\n");
+        goto exit;
+    }
+    file->private_data = &sdio_bt;
+    if (!amlbt_w2ls_coex_is_running(&sdio_bt))
+    {
+        amlbt_load_conf(&sdio_bt);
+        ret = amlbt_load_firmware(&sdio_bt);
+        if (ret != 0)
+        {
+            BTI("amlbt_load_firmware failed!\n");
+            amlbt_w2ls_coex_zigbee_res_deinit(&sdio_bt);
+            goto exit;
+        }
+    }
+    sdio_bt.zigbee_start = 1;
+exit:
+    return nonseekable_open(inode, file);
+}
+
+static int amlbt_w2ls_zigbee_fops_close(struct inode *inode, struct file *file)
+{
+    BTI("%s, %d version:%s \n", __func__, sdio_bt.zigbee_start, AML_W2LS_VERSION);
+
+    if (sdio_bt.zigbee_start)
+    {
+        amlbt_show_fw_debug_info();
+        amlbt_w2ls_coex_zigbee_res_deinit(&sdio_bt);
+        sdio_bt.zigbee_start = 0;
+    }
+    return 0;
+}
+
+static ssize_t amlbt_w2ls_zigbee_fops_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p)
+{
+    struct sk_buff *skb;
+    static unsigned char w_type = 0;
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file_p->private_data;
+    unsigned char *p;
+
+    if (!p_bt->zigbee_start)
+    {
+        BTE("%s:%d p_bt->zigbee_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    if (p_bt->hu == NULL)
+    {
+        BTE("%s:%d p_bt->hu == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    if (count == 1) //host write hci type
+    {
+        get_user(w_type, buf_p);
+    }
+    else
+    {
+        skb = alloc_skb(count+1, GFP_KERNEL);
+        if (!skb)
+        {
+            return -ENOMEM;
+        }
+        p = skb->data;
+        *(unsigned char *)skb_put(skb, 1) = w_type;
+
+        if (copy_from_user(skb_put(skb, count), buf_p, count))
+        {
+            kfree_skb(skb);
+            return -EFAULT;
+        }
+        skb_queue_tail(&p_bt->hu->tx_queue, skb);
+        //BTI("zigbee write %d, [%#x,%#x,%#x,%#x] \n", count, p[0], p[1], p[2], p[3]);
+        amlbt_w2ls_uart_tx_wakeup(p_bt->hu);
+    }
+
+    return count;
+}
+
+static ssize_t amlbt_w2ls_zigbee_fops_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p)
+{
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file_p->private_data;
+    static struct sk_buff *skb;
+
+    if (!p_bt->zigbee_start)
+    {
+        BTE("%s:%d p_bt->zigbee_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    switch (p_bt->zigbee_rd_state)
+    {
+        case HCI_RX_TYPE:
+        {
+            skb = skb_dequeue(&p_bt->zigbee_rx_queue);
+            if (!skb)
+            {
+                BTE("zb HCI_RX_TYPE no data!\n");
+                return 0;
+            }
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            p_bt->zigbee_rd_state = HCI_RX_HEADER;
+        }
+        break;
+        case HCI_RX_HEADER:
+        {
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            if (skb->len == 0)
+            {
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+            }
+            else
+            {
+                p_bt->zigbee_rd_state = HCI_RX_PAYLOAD;
+            }
+        }
+        break;
+        case HCI_RX_PAYLOAD:
+        {
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            kfree_skb(skb);
+            p_bt->zigbee_rd_state = HCI_RX_TYPE;
+        }
+        break;
+
+    }
+    return count;
+}
+
+/*----------------------------------------------------thread node----------------------------------------------------------*/
+
+static unsigned int amlbt_w2ls_thread_fops_poll(struct file *file, poll_table *wait)
+{
+    int mask = 0;
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file->private_data;
+
+    poll_wait(file, &p_bt->thread_wait_queue, wait);
+
+    if (!p_bt->thread_start)
+    {
+        goto exit;
+    }
+
+    if (p_bt->thread_rd_state || skb_queue_len(&p_bt->thread_rx_queue) > 0)
+    {
+        mask |= POLLIN | POLLRDNORM;
+    }
+
+exit:
+    return mask;
+}
+
+
+static int amlbt_w2ls_thread_fops_open(struct inode *inode, struct file *file)
+{
+    int ret = 0;
+
+    BTI("%s, %d, version:%s \n", __func__, sdio_bt.thread_start, AML_W2LS_VERSION);
+
+    if (sdio_bt.thread_start)
+    {
+        BTE("thread open status error!\n");
+        return -EFAULT;
+    }
+
+    if (amlbt_w2ls_coex_thread_res_init(&sdio_bt) != 0)
+    {
+        BTI("amlbt_sdio_res_init failed!\n");
+        goto exit;
+    }
+    file->private_data = &sdio_bt;
+    if (!amlbt_w2ls_coex_is_running(&sdio_bt))
+    {
+        amlbt_load_conf(&sdio_bt);
+        ret = amlbt_load_firmware(&sdio_bt);
+        if (ret != 0)
+        {
+            BTI("amlbt_load_firmware failed!\n");
+            amlbt_w2ls_coex_thread_res_deinit(&sdio_bt);
+            goto exit;
+        }
+    }
+    sdio_bt.thread_start = 1;
+exit:
+    return nonseekable_open(inode, file);
+}
+
+static int amlbt_w2ls_thread_fops_close(struct inode *inode, struct file *file)
+{
+    BTI("%s, %d version:%s \n", __func__, sdio_bt.thread_start, AML_W2LS_VERSION);
+
+    if (sdio_bt.thread_start)
+    {
+        amlbt_show_fw_debug_info();
+        amlbt_w2ls_coex_thread_res_deinit(&sdio_bt);
+        sdio_bt.thread_start = 0;
+    }
+    return 0;
+}
+
+static ssize_t amlbt_w2ls_thread_fops_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p)
+{
+    struct sk_buff *skb;
+    static unsigned char w_type = 0;
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file_p->private_data;
+    unsigned char *p;
+
+    if (!p_bt->thread_start)
+    {
+        BTE("%s:%d p_bt->thread_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    if (count == 1) //host write hci type
+    {
+        get_user(w_type, buf_p);
+    }
+    else
+    {
+        skb = alloc_skb(count+1, GFP_KERNEL);
+        if (!skb)
+        {
+            return -ENOMEM;
+        }
+
+        p = skb->data;
+
+        *(unsigned char *)skb_put(skb, 1) = w_type;
+
+        if (copy_from_user(skb_put(skb, count), buf_p, count))
+        {
+            kfree_skb(skb);
+            return -EFAULT;
+        }
+        skb_queue_tail(&p_bt->hu->tx_queue, skb);
+        //BTI("thread write %d, [%#x,%#x,%#x,%#x] \n", count, p[0], p[1], p[2], p[3]);
+        amlbt_w2ls_uart_tx_wakeup(p_bt->hu);
+    }
+
+    return count;
+}
+
+static ssize_t amlbt_w2ls_thread_fops_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p)
+{
+    w2l_sdio_bt_t *p_bt = (w2l_sdio_bt_t *)file_p->private_data;
+    static struct sk_buff *skb;
+
+    if (!p_bt->thread_start)
+    {
+        BTE("%s:%d p_bt->thread_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    switch (p_bt->thread_rd_state)
+    {
+        case HCI_RX_TYPE:
+        {
+            skb = skb_dequeue(&p_bt->thread_rx_queue);
+            if (!skb)
+            {
+                BTE("td HCI_RX_TYPE no data!\n");
+                return 0;
+            }
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            p_bt->thread_rd_state = HCI_RX_HEADER;
+        }
+        break;
+        case HCI_RX_HEADER:
+        {
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            if (skb->len == 0)
+            {
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+            }
+            else
+            {
+                p_bt->thread_rd_state = HCI_RX_PAYLOAD;
+            }
+        }
+        break;
+        case HCI_RX_PAYLOAD:
+        {
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            kfree_skb(skb);
+            p_bt->thread_rd_state = HCI_RX_TYPE;
+        }
+        break;
+
+    }
+    return count;
+}
+
+static int amlbt_w2ls_coex_fops_open(struct inode *inode, struct file *file)
+{
+    BTI("%s \n", __func__);
+    file->private_data = &sdio_bt;
+    return nonseekable_open(inode, file);
+}
+
+static int amlbt_w2ls_coex_fops_close(struct inode *inode, struct file *file)
+{
+    BTI("%s \n", __func__);
+
+    return 0;
+}
+
+/*-------------------------------------------------------------------------------------------------------------------------*/
+
+
+/**-------------------------------------------tty discipline----------------------------------**/
+
+static int amlbt_w2ls_uart_tty_open(struct tty_struct *tty);
+static void amlbt_w2ls_uart_tty_close(struct tty_struct *tty);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 20)
+static ssize_t amlbt_w2ls_uart_tty_read(struct tty_struct *tty, struct file *file,
+                 unsigned char *buf, size_t nr,
+                 void **cookie, unsigned long offset);
+#else
+static ssize_t amlbt_w2ls_uart_tty_read(struct tty_struct *tty, struct file *file,
+                             unsigned char __user *buf, size_t nr);
+#endif
+static ssize_t amlbt_w2ls_uart_tty_write(struct tty_struct *tty, struct file *file,
+                  const unsigned char *data, size_t count);
+static __poll_t amlbt_w2ls_uart_tty_poll(struct tty_struct *tty,
+                  struct file *filp, poll_table *wait);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
+static void amlbt_w2ls_uart_tty_receive(struct tty_struct *tty, const unsigned char *data, char *flags, int count);
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+static void amlbt_w2ls_uart_tty_receive(struct tty_struct *tty, const uint8_t *data, const char *flags, int count);
+#else
+static void amlbt_w2ls_uart_tty_receive(struct tty_struct *tty, const uint8_t *data, const uint8_t *flags, size_t count);
+#endif
+static struct tty_ldisc_ops amlbt_w2ls_uart_ldisc = {
+    .owner      = THIS_MODULE,
+    .num        = N_HCI,
+    .name       = "n_hci",
+    .open       = amlbt_w2ls_uart_tty_open,
+    .close      = amlbt_w2ls_uart_tty_close,
+    .read       = amlbt_w2ls_uart_tty_read,
+    .write      = amlbt_w2ls_uart_tty_write,
+    .ioctl      = NULL,
+    .compat_ioctl   = NULL,
+    .poll       = amlbt_w2ls_uart_tty_poll,
+    .receive_buf    = amlbt_w2ls_uart_tty_receive,
+    //.write_wakeup = hci_uart_tty_wakeup,
+    .write_wakeup   = NULL,
+};
+
+static struct sk_buff *amlbt_w2ls_uart_dequeue(struct hci_uart *hu, struct sk_buff_head *p_head)
+{
+    struct sk_buff *skb = skb_dequeue(p_head);
+
+    return skb;
+}
+
+static void amlbt_w2ls_uart_write_work(struct work_struct *work)
+{
+    struct hci_uart *hu = container_of(work, struct hci_uart, write_work);
+    struct tty_struct *tty = hu->tty;
+    struct sk_buff *skb;
+
+    /* REVISIT: should we cope with bad skbs or ->write() returning
+     * and error value ?
+     */
+
+restart:
+    clear_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
+
+    //BTI("amlbt_w2ls_uart_write_work \n");
+
+    while ((skb = amlbt_w2ls_uart_dequeue(hu, &hu->tx_queue))) {
+        int len;
+
+
+        //BTI("amlbt_w2ls_uart_dequeue skb->len %d \n", skb->len);
+        set_bit(TTY_DO_WRITE_WAKEUP, &tty->flags);
+        len = tty->ops->write(tty, skb->data, skb->len);
+
+        skb_pull(skb, len);
+        if (skb->len) {
+            hu->tx_skb = skb;
+            break;
+        }
+
+        //hci_uart_tx_complete(hu, skb->data[0]);
+        kfree_skb(skb);
+        //BTI("amlbt_w2ls_uart_write_work complete! \n");
+    }
+
+    clear_bit(HCI_UART_SENDING, &hu->tx_state);
+    if (test_bit(HCI_UART_TX_WAKEUP, &hu->tx_state))
+        goto restart;
+
+    wake_up_bit(&hu->tx_state, HCI_UART_SENDING);
+}
+
+static int amlbt_w2ls_uart_tty_open(struct tty_struct *tty)
+{
+    struct hci_uart *hu;
+
+    BTI("amlbt_w2ls_uart_tty_open tty %p \n", tty);
+
+    /* Error if the tty has no write op instead of leaving an exploitable
+     * hole
+     */
+    if (tty->ops->write == NULL)
+    {
+        BTE("amlbt_w2ls_uart_tty_open EOPNOTSUPP \n");
+        return -EOPNOTSUPP;
+    }
+    hu = kzalloc(sizeof(struct hci_uart), GFP_KERNEL);
+    if (!hu) {
+        BTE("Can't allocate control structure \n");
+        return -ENFILE;
+    }
+    tty->disc_data = hu;
+    hu->tty = tty;
+    tty->receive_room = 65536;
+
+    /* disable alignment support by default */
+    hu->alignment = 1;
+    hu->padding = 0;
+    hu->rx_skb = NULL;
+    hu->rx_state = HCI_RX_TYPE;
+    memset(hu->uart_buf, 0, sizeof(hu->uart_buf));
+    hu->p_ub = &hu->uart_buf[0];
+    skb_queue_head_init(&hu->tx_queue);
+    skb_queue_head_init(&hu->rx_queue);
+    init_waitqueue_head(&hu->wait_queue);
+    //INIT_WORK(&hu->init_ready, hci_uart_init_work);
+    INIT_WORK(&hu->write_work, amlbt_w2ls_uart_write_work);
+    percpu_init_rwsem(&hu->proto_lock);
+    /* Flush any pending characters in the driver */
+    tty_driver_flush_buffer(tty);
+    BTI("amlbt_w2ls_uart_tty_open success!\n");
+    set_bit(HCI_UART_PROTO_READY, &hu->flags);
+    sdio_bt.hu = hu;
+    return 0;
+}
+
+static void amlbt_w2ls_uart_tty_close(struct tty_struct *tty)
+{
+    struct hci_uart *hu = tty->disc_data;
+
+    BTI("amlbt_w2ls_uart_tty_close tty %p", tty);
+    /* Detach from the tty */
+    tty->disc_data = NULL;
+
+    if (!hu)
+        return;
+
+    if (test_bit(HCI_UART_PROTO_READY, &hu->flags)) {
+        percpu_down_write(&hu->proto_lock);
+        clear_bit(HCI_UART_PROTO_READY, &hu->flags);
+        percpu_up_write(&hu->proto_lock);
+
+        //cancel_work_sync(&hu->init_ready);
+        cancel_work_sync(&hu->write_work);
+        //hu->proto->close(hu);
+    }
+    clear_bit(HCI_UART_PROTO_SET, &hu->flags);
+
+    percpu_free_rwsem(&hu->proto_lock);
+    skb_queue_purge(&hu->tx_queue);
+    skb_queue_purge(&hu->rx_queue);
+    kfree(hu);
+}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 20)
+static ssize_t amlbt_w2ls_uart_tty_read(struct tty_struct *tty, struct file *file,
+                 unsigned char *buf, size_t nr,
+                 void **cookie, unsigned long offset)
+#else
+static ssize_t amlbt_w2ls_uart_tty_read(struct tty_struct *tty, struct file *file,
+                             unsigned char __user *buf, size_t nr)
+#endif
+{
+    BTI("%s \n", __func__);
+    return 0;
+}
+
+static ssize_t amlbt_w2ls_uart_tty_write(struct tty_struct *tty, struct file *file,
+                  const unsigned char *data, size_t count)
+{
+    BTI("%s \n", __func__);
+    return 0;
+}
+
+static __poll_t amlbt_w2ls_uart_tty_poll(struct tty_struct *tty,
+                      struct file *filp, poll_table *wait)
+{
+    BTI("%s \n", __func__);
+    return 0;
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
+static void amlbt_w2ls_uart_tty_receive(struct tty_struct *tty, const unsigned char *data, char *flags, int count)
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+static void amlbt_w2ls_uart_tty_receive(struct tty_struct *tty, const uint8_t *data, const char *flags, int count)
+#else
+static void amlbt_w2ls_uart_tty_receive(struct tty_struct *tty, const uint8_t *data, const uint8_t *flags, size_t count)
+#endif
+{
+    static struct hci_uart_rx rx = { .state = HCI_STATE_RX_TYPE, .payload = NULL };
+    struct hci_uart *hu;
+    w2l_sdio_bt_t *p_bt = &sdio_bt;
+
+    if (!tty || !data)
+    {
+        BTE("amlbt_w2ls_uart_tty_receive:tty or data NULL!\n");
+        return;
+    }
+
+    hu = tty->disc_data;
+    if (!hu)
+    {
+        BTE("amlbt_w2ls_uart_tty_receive:hu NULL!\n");
+        return;
+    }
+
+    BTP("amlbt_w2ls_uart_tty_receive %d, %p, [%#x,%#x,%#x,%#x,%#x,%#x] \n", count, hu->rx_skb,
+                               data[0], data[1], data[2], data[3], data[4], data[5]);
+
+    while (count > 0) {
+        switch (rx.state) {
+            case HCI_STATE_RX_TYPE:
+                rx.type = *data++;
+                BTP("type:%#x\n", rx.type);
+                if (rx.type != HCI_TYPE_EVENT && rx.type != HCI_TYPE_ACL && rx.type != HCI_TYPE_15P4)
+                {
+                    BTE("[aml tty error]:type error!!\n");
+                    schedule_work(&sdio_bt.exception_work);
+                    return;
+                }
+                count--;
+                rx.received_length = 0;
+                if (rx.type == HCI_TYPE_EVENT)
+                {
+                    rx.expected_length = 2;
+                    rx.header_len = 3;
+                }
+                else if (rx.type == HCI_TYPE_ACL)
+                {
+                    rx.expected_length = 4;
+                    rx.header_len = 5;
+                }
+                else if (rx.type == HCI_TYPE_15P4)
+                {
+                    rx.expected_length = 4;
+                    rx.header_len = 5;
+                }
+
+                //rx.expected_length = (rx.type == HCI_TYPE_EVENT) ? 2 : 4;
+                rx.state = HCI_STATE_RX_HEADER;
+                break;
+
+            case HCI_STATE_RX_HEADER:
+                while (count > 0 && rx.received_length < rx.expected_length) {
+                    rx.header[rx.received_length++] = *data++;
+                    count--;
+                }
+                if (rx.received_length == rx.expected_length) {
+                    // calc header length
+                    if (rx.type == HCI_TYPE_EVENT) {
+                        rx.expected_length = rx.header[1];
+                    } else if (rx.type == HCI_TYPE_ACL) {
+                        rx.expected_length = rx.header[2] | (rx.header[3] << 8);
+                    } else if (rx.type == HCI_TYPE_15P4) {
+                        rx.expected_length = (rx.header[2] | (rx.header[3] << 8)) + 2;  // 15.4 pyaload + 2 bytes crc
+                        //BTE("HCI_TYPE_15P4:%d\n", rx.expected_length);
+                    }
+
+                    BTP("header %d:[%#x,%#x,%#x,%#x]\n", rx.expected_length,
+                        rx.header[0], rx.header[1], rx.header[2], rx.header[3]);
+
+                    //if (rx.type != HCI_TYPE_EVENT && rx.type != HCI_TYPE_ACL && rx.type != HCI_TYPE_15P4)
+                    //{
+                        ///BTE("[aml tty error]:type error!!\n");
+                        //return;
+                    //}
+                    rx.received_length = 0;
+                    rx.payload = kmalloc(rx.expected_length, GFP_KERNEL);
+                    if (!rx.payload) {
+                        rx.state = HCI_STATE_RX_TYPE;
+                        return;
+                    }
+                    rx.state = HCI_STATE_RX_PAYLOAD;
+                }
+                break;
+
+            case HCI_STATE_RX_PAYLOAD:
+                while (count > 0 && rx.received_length < rx.expected_length) {
+                    rx.payload[rx.received_length++] = *data++;
+                    count--;
+                }
+                if (rx.received_length == rx.expected_length) {
+                    BTP("payload %d:%d\n", rx.received_length, rx.header_len);
+                    hu->rx_skb = alloc_skb(rx.received_length + rx.header_len, GFP_ATOMIC);
+                    if (!hu->rx_skb)
+                    {
+                        BTE("[aml tty error]:skb error!!\n");
+                        return;
+                    }
+                    skb_put_data(hu->rx_skb, &rx.type, 1);
+                    if (rx.type == HCI_TYPE_EVENT)
+                    {
+                        skb_put_data(hu->rx_skb, rx.header, 2);
+                    }
+                    else if (rx.type == HCI_TYPE_ACL)
+                    {
+                        skb_put_data(hu->rx_skb, rx.header, 4);
+                    }
+                    else if (rx.type == HCI_TYPE_15P4)
+                    {
+                        skb_put_data(hu->rx_skb, rx.header, 4);
+                    }
+                    skb_put_data(hu->rx_skb, rx.payload, rx.expected_length);
+                    //process_hci_packet(rx.type, rx.header, rx.payload, rx.expected_length);
+                    kfree(rx.payload);
+                    rx.payload = NULL;
+                    rx.state = HCI_STATE_RX_TYPE;
+#if 0
+                    if (rx.type == HCI_TYPE_EVENT || rx.type == HCI_TYPE_ACL)
+                    {
+                        //BTI("HCI complete bluetooth!\n");
+                        skb_queue_tail(&p_bt->bt_rx_queue, hu->rx_skb);
+                        wake_up_interruptible(&p_bt->bt_wait_queue);
+                    }
+                    else if (rx.type == HCI_TYPE_15P4 && rx.header[0] == HCI_TYPE_ZIGBEE)
+                    {
+                        //BTI("HCI complete zigbee!\n");
+                        skb_queue_tail(&p_bt->zigbee_rx_queue, hu->rx_skb);
+                        wake_up_interruptible(&p_bt->zigbee_wait_queue);
+                    }
+                    else if (rx.type == HCI_TYPE_15P4 && rx.header[0] == HCI_TYPE_THREAD)
+                    {
+                        //BTI("HCI complete thread!\n");
+                        skb_queue_tail(&p_bt->thread_rx_queue, hu->rx_skb);
+                        wake_up_interruptible(&p_bt->thread_wait_queue);
+                    }
+                    else
+                    {
+                        BTF("unknown hci packet!!!\n");
+                        kfree(hu->rx_skb);
+                    }
+#else
+                    if (rx.type == HCI_TYPE_EVENT || rx.type == HCI_TYPE_ACL || rx.type == HCI_TYPE_15P4)
+                    {
+                        BTP("HCI complete bluetooth!\n");
+                        skb_queue_tail(&p_bt->bt_rx_queue, hu->rx_skb);
+                        wake_up_interruptible(&p_bt->bt_wait_queue);
+                    }
+                    else
+                    {
+                        BTF("unknown hci packet!!!\n");
+                        kfree(hu->rx_skb);
+                    }
+#endif
+                    hu->rx_skb = NULL;
+                }
+                break;
+        }
+    }
+}
+
+static int amlbt_w2ls_uart_tx_wakeup(struct hci_uart *hu)
+{
+    /* This may be called in an IRQ context, so we can't sleep. Therefore
+     * we try to acquire the lock only, and if that fails we assume the
+     * tty is being closed because that is the only time the write lock is
+     * acquired. If, however, at some point in the future the write lock
+     * is also acquired in other situations, then this must be revisited.
+     */
+    if (!percpu_down_read_trylock(&hu->proto_lock))
+    {
+        BTE("amlbt_w2ls_uart_tx_wakeup error 1! \n");
+        return 0;
+    }
+    if (!test_bit(HCI_UART_PROTO_READY, &hu->flags))
+    {
+        //printk(KERN_INFO "amlbt_w2ls_uart_tx_wakeup error 2! \n");
+        goto no_schedule;
+    }
+    set_bit(HCI_UART_TX_WAKEUP, &hu->tx_state);
+    if (test_and_set_bit(HCI_UART_SENDING, &hu->tx_state))
+    {
+        //printk(KERN_INFO "amlbt_w2ls_uart_tx_wakeup error 3! \n");
+        goto no_schedule;
+    }
+    //printk(KERN_INFO "amlbt_w2ls_uart_tx_wakeup work! \n");
+
+    schedule_work(&hu->write_work);
+
+no_schedule:
+    percpu_up_read(&hu->proto_lock);
+
+    return 0;
+}
+
+static void amlbt_w2ls_exception_func(struct work_struct *work)
+{
+    w2l_sdio_bt_t *p_sdio = &sdio_bt;
+    struct sk_buff      *skb;
+    unsigned char bt_hw_error[5] = {0x04, 0x10, 0x01, 0x00, 0x00};
+    unsigned char zigbee_hw_error[8] = {0x10, 0xfa, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00};
+    unsigned char thread_hw_error[8] = {0x10, 0xfa, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00};
+
+    BTF("Coex driver detect excepion! [%#x,%#x,%#x]\n",
+        p_sdio->bt_start, p_sdio->zigbee_start, p_sdio->thread_start);
+
+    if (p_sdio->bt_start || p_sdio->zigbee_start || p_sdio->thread_start)
+    {
+        if (p_sdio->bt_start)
+        {
+            skb_queue_purge(&p_sdio->bt_tx_queue);
+            skb_queue_purge(&p_sdio->bt_rx_queue);
+        }
+        if (p_sdio->zigbee_start)
+        {
+            skb_queue_purge(&p_sdio->zigbee_tx_queue);
+            skb_queue_purge(&p_sdio->zigbee_rx_queue);
+        }
+        if (p_sdio->thread_start)
+        {
+            skb_queue_purge(&p_sdio->thread_tx_queue);
+            skb_queue_purge(&p_sdio->thread_rx_queue);
+        }
+
+        amlbt_load_firmware(&sdio_bt);
+
+        if (p_sdio->bt_start)
+        {
+            skb = alloc_skb(sizeof(bt_hw_error), GFP_ATOMIC);
+            if (!skb)
+            {
+                BTF("bt skb error!!\n");
+                return;
+            }
+            skb_put_data(skb, bt_hw_error, sizeof(bt_hw_error));
+            BTF("Report bt hw error!\n");
+            skb_queue_tail(&p_sdio->bt_rx_queue, skb);
+            wake_up_interruptible(&p_sdio->bt_wait_queue);
+        }
+
+        if (p_sdio->zigbee_start)
+        {
+            skb = alloc_skb(sizeof(zigbee_hw_error), GFP_ATOMIC);
+            if (!skb)
+            {
+                BTF("zigbee skb error!!\n");
+                return;
+            }
+            skb_put_data(skb, zigbee_hw_error, sizeof(zigbee_hw_error));
+            BTF("Report zigbee hw error!\n");
+            skb_queue_tail(&p_sdio->zigbee_rx_queue, skb);
+            wake_up_interruptible(&p_sdio->zigbee_wait_queue);
+        }
+
+        if (p_sdio->thread_start)
+        {
+            skb = alloc_skb(sizeof(thread_hw_error), GFP_ATOMIC);
+            if (!skb)
+            {
+                BTF("thread skb error!!\n");
+                return;
+            }
+            skb_put_data(skb, thread_hw_error, sizeof(thread_hw_error));
+            BTF("Report thread hw error!\n");
+            skb_queue_tail(&p_sdio->thread_rx_queue, skb);
+            wake_up_interruptible(&p_sdio->thread_wait_queue);
+        }
+    }
+
+    BTF("Coex driver excepion finish!\n");
+}
 

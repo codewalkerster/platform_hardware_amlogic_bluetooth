@@ -28,10 +28,12 @@
 #include <linux/amlogic/pm.h>
 #include <linux/firmware.h>
 #include <linux/jiffies.h>
-#include <linux/sched.h>
 #include <linux/wait.h>
 #include <linux/input.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+#include <linux/sched/clock.h>
+#endif
 
 #include "common.h"
 #include "w2l_bt_entry.h"
@@ -137,6 +139,12 @@ Command FIFO, start:0x00518000, end:0x00519000, length:4096 bytes
 #define FIFO_FW_MANFDATA_ADDR   (HI_USB_EVENT_Q_ADDR + POLL_TOTAL_LEN + RC_MANFDATA_LEN + 4) //addr 0x514970 usb bulk 16 bit alignment
 #define FIFO_FW_MAC_ADDR        (HI_USB_EVENT_Q_ADDR + POLL_TOTAL_LEN + 2*RC_MANFDATA_LEN + 4) //addr 0x5149a0 usb bulk 16 bit alignment
 
+enum bt_polling_interval{
+    POLLING_LEVEL_1 = 1000000,
+    POLLING_LEVEL_2 = 5000000,
+    POLLING_LEVEL_3 = 8000000,
+};
+
 enum bt_rx_state{
     HCI_RX_TYPE,
     HCI_RX_HEADER,
@@ -145,6 +153,10 @@ enum bt_rx_state{
 };
 
 #define AML_BT_CHAR_DEVICE_NAME     "aml_btusb"
+#define AML_ZIGBEE_NOTE                 "aml_zigbee"
+#define AML_THREAD_NOTE                 "aml_thread"
+#define AML_COEX_NOTE                   "aml_coex"
+
 #define AML_BT_FIRMWARE_NAME        "w2l_bt_15p4_fw_usb.bin"
 #define AML_BT_FIRMWARE_TXT_NAME    "w2l_bt_15p4_fw_usb.txt"
 #define AML_BT_FIRMWARE_FT_NAME     "w2l_bt_15p4_fw_usb_test.bin"
@@ -169,6 +181,7 @@ enum bt_rx_state{
 #define BT_DRV_STATE_RESUME            BIT(2)
 #define BT_DRV_STATE_RECOVERY          BIT(3)
 //#define BT_DRV_STATE_SEND              BIT(4)
+#define BT_DRV_STATE_WAIT_RECOVERY     BIT(5)
 
 enum bt_drv_state
 {
@@ -178,12 +191,14 @@ enum bt_drv_state
     BT_DRV_SUSPEND,
     BT_DRV_RESUME_ENTRY,
     BT_DRV_RESUME,
+    BT_DRV_WAIT_RECOVERY
 };
 
 #define REG_DEV_RESET           0xf03058
 #define REG_FW_MODE             0xf000e0
 #define REG_PMU_POWER_CFG       0xf03040
 #define REG_RAM_PD_SHUTDWONW_SW 0xf03050
+#define REG_FW_PC               0x200034
 
 #define BIT_PHY                 1
 #define BIT_MAC                 (1 << 1)
@@ -255,6 +270,8 @@ enum wifi_cmd {
 #define AML_XFER_TO_DEVICE      0
 #define AML_XFER_TO_HOST        0x80
 #define AML_USB_CONTROL_MSG_TIMEOUT 3000
+//wait usb recovery time 10s
+#define MAX_TIMEOUT             10000000000
 
 #define WRITE_SRAM_DATA_LEN 477
 
@@ -290,19 +307,6 @@ struct crg_msc_cbw {
     unsigned char resv[481];
 }__attribute__ ((packed));
 
-struct aml_bus_state_detect {
-    unsigned char bus_err;
-    unsigned char usb_disconnect;
-    unsigned char is_drv_load_finished;
-    unsigned char bus_reset_ongoing;
-    unsigned char is_load_by_timer;
-    unsigned char is_recy_ongoing;
-    struct timer_list timer;
-    struct work_struct detect_work;
-    int (*insmod_drv)(void);
-    unsigned char usb_suspend;
-};
-
 extern struct usb_device *g_udev;
 static struct crg_msc_cbw *g_cmd_buf;
 
@@ -316,7 +320,11 @@ static w2l_usb_bt_new_t amlbt_dev = {0};
 //static void amlbt_shutdown_func(void);
 
 static int amlbt_probe(struct platform_device *dev);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static int amlbt_remove(struct platform_device *dev);
+#else
+static void amlbt_remove(struct platform_device *dev);
+#endif
 static int amlbt_suspend(struct platform_device *dev, pm_message_t state);
 static int amlbt_resume(struct platform_device *dev);
 static void amlbt_shutdown(struct platform_device *dev);
@@ -332,7 +340,7 @@ static ssize_t amlbt_read(struct file *file_p,
                                    size_t count,
                                    loff_t *pos_p);
 static unsigned int amlbt_poll(struct file *file, poll_table *wait);
-static int amlbt_submit_poll_urb(w2l_usb_bt_new_t *p_bt);
+//static int amlbt_submit_poll_urb(w2l_usb_bt_new_t *p_bt);
 
 static void amlbt_lateresume(struct early_suspend *h);
 static void amlbt_earlysuspend(struct early_suspend *h);
@@ -343,11 +351,31 @@ static int amlbt_load_conf(w2l_usb_bt_new_t *p_bt);
 static int amlbt_res_init(w2l_usb_bt_new_t *p_bt);
 static void amlbt_res_deinit(w2l_usb_bt_new_t *p_bt);
 static int amlbt_sw_reset(void);
+static unsigned int amlbt_w2lu_coex_is_running(w2l_usb_bt_new_t *p_bt);
+
+static int amlbt_coex_open(struct inode *inode, struct file *file);
+static int amlbt_coex_close(struct inode *inode, struct file *file);
+static int amlbt_zigbee_open(struct inode *inode, struct file *file);
+static int amlbt_zigbee_close(struct inode *inode, struct file *file);
+static ssize_t amlbt_zigbee_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p);
+static ssize_t amlbt_zigbee_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p);
+static unsigned int amlbt_zigbee_poll(struct file *file, poll_table *wait);
+
+static int amlbt_thread_open(struct inode *inode, struct file *file);
+static int amlbt_thread_close(struct inode *inode, struct file *file);
+static ssize_t amlbt_thread_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p);
+static ssize_t amlbt_thread_read(struct file *file_p, char __user *buf_p, size_t count, loff_t *pos_p);
+static unsigned int amlbt_thread_poll(struct file *file, poll_table *wait);
+
+static void amlbt_write_work(struct work_struct *work);
+
 
 static long amlbt_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
 #ifdef CONFIG_COMPAT
 static long amlbt_compat_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
 #endif
+static void amlbt_usb_fw_rx_work(struct work_struct *work);
+static enum hrtimer_restart amlbt_hrtime(struct hrtimer *timer);
 
 static void amlbt_release(struct device *dev)
 {
@@ -388,6 +416,48 @@ static const struct file_operations amlbt_fops =
     .compat_ioctl = amlbt_compat_ioctl,
 #endif
     .poll       = amlbt_poll,
+    .fasync     = NULL
+};
+
+static const struct file_operations amlbt_zigbee_fops =
+{
+    .open       = amlbt_zigbee_open,
+    .release    = amlbt_zigbee_close,
+    .write      = amlbt_zigbee_write,
+    .read      = amlbt_zigbee_read,
+    .unlocked_ioctl = amlbt_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = amlbt_compat_ioctl,
+#endif
+    .poll       = amlbt_zigbee_poll,
+    .fasync     = NULL
+};
+
+static const struct file_operations amlbt_thread_fops =
+{
+    .open       = amlbt_thread_open,
+    .release    = amlbt_thread_close,
+    .write      = amlbt_thread_write,
+    .read      = amlbt_thread_read,
+    .unlocked_ioctl = amlbt_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = amlbt_compat_ioctl,
+#endif
+    .poll       = amlbt_thread_poll,
+    .fasync     = NULL
+};
+
+static const struct file_operations amlbt_coex_fops =
+{
+    .open       = amlbt_coex_open,
+    .release    = amlbt_coex_close,
+    .write      = NULL,
+    .read      = NULL,
+    .unlocked_ioctl = amlbt_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = amlbt_compat_ioctl,
+#endif
+    .poll       = NULL,
     .fasync     = NULL
 };
 
@@ -553,7 +623,6 @@ static void amlbt_drv_state_clr(unsigned int bit)
 
 static int amlbt_check_usb(void)
 {
-    int wait_cnt = 0;
     w2l_usb_bt_new_t *p_bt = &amlbt_dev;
 
     if (g_udev == NULL)
@@ -562,27 +631,15 @@ static int amlbt_check_usb(void)
         return -1;
     }
 
-    while (bus_state_detect.bus_err || bus_state_detect.bus_reset_ongoing || bus_state_detect.is_recy_ongoing || (enum usb_udev_state)g_udev->state != USB_CONFIGURED)
+    if (bus_state_detect.bus_err || bus_state_detect.bus_reset_ongoing || bus_state_detect.is_recy_ongoing || (enum usb_udev_state)g_udev->state != USB_CONFIGURED)
     {
-        wait_cnt = 0;
-        BTI("recy start");
-        if (p_bt->firmware_start)
+        if (!(p_bt->dr_state & BT_DRV_STATE_WAIT_RECOVERY))
         {
-            up(&amlbt_dev.sr_sem);
+            p_bt->wait_start = sched_clock();
+            amlbt_drv_state_set(BT_DRV_STATE_WAIT_RECOVERY);
         }
-        amlbt_wakeup_lock();
-        while (bus_state_detect.bus_err || bus_state_detect.bus_reset_ongoing || bus_state_detect.is_recy_ongoing || (enum usb_udev_state)g_udev->state != USB_CONFIGURED)
-        {
-            usleep_range(20000, 20000);
-            if (wait_cnt++ >= 500)
-            {
-                BTE("bus_err %d reset %d recy %d udev %d", bus_state_detect.bus_err, bus_state_detect.bus_reset_ongoing,
-                            bus_state_detect.is_recy_ongoing, g_udev->state);
-                break;
-            }
-        }
-        amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-        BTI("recy end");
+        BTE("bus_err %d reset %d recy %d udev %d", bus_state_detect.bus_err, bus_state_detect.bus_reset_ongoing,
+                    bus_state_detect.is_recy_ongoing, g_udev->state);
         return -1;
     }
     return 0;
@@ -958,12 +1015,17 @@ err_exit:
     return ret;
 }
 
-static unsigned int amlbt_aon_addr_bit_get(unsigned int addr, unsigned int bit)
+static int amlbt_aon_addr_bit_get(unsigned int addr, unsigned int bit)
 {
     unsigned int reg_value = 0;
-    unsigned int bit_value = 0;
+    int bit_value = 0;
+    int ret = -1;
 
-    amlbt_read_word(addr, USB_EP2, &reg_value);
+    ret = amlbt_read_word(addr, USB_EP2, &reg_value);
+    if (ret == -1)
+    {
+        return ret;
+    }
     bit_value = (reg_value >> bit) & 0x1;
     BTI("get %#x bit%#d: %#x\n", addr, bit, bit_value);
 
@@ -1049,41 +1111,59 @@ static int amlbt_powersave_clear(void)
         }
     }
     // wait bt  wake done 1s
-    while (amlbt_aon_addr_bit_get(RG_AON_A55, 29))
-    {
-        usleep_range(20000, 20000);
-        if (wait_cnt++ > 50)
-            break;
-    }
+     do
+     {
+         ret = amlbt_aon_addr_bit_get(RG_AON_A17, 29);
+         if (ret == -1)
+         {
+             goto exit;
+         }
+         usleep_range(20000, 20000);
+         if (wait_cnt++ > 50)
+             break;
+     } while (ret);
     return 0;
 exit:
     return ret;
 }
 
-static int amlbt_resume_fw(void)
+static int amlbt_resume_fw(w2l_usb_bt_new_t *p_bt)
 {
     int wait_cnt = 0;
     int retry_cnt = 0;
     int ret = -1;
     //wait usb bus ready
-    if ((atomic_read(&g_wifi_pm.bus_suspend_cnt) == 0 && (enum usb_udev_state)g_udev->state == USB_CONFIGURED)
-                                || bus_state_detect.is_recy_ongoing)
+    //if ((atomic_read(&g_wifi_pm.bus_suspend_cnt) == 0 && (enum usb_udev_state)g_udev->state == USB_CONFIGURED)
+    //                            || bus_state_detect.is_recy_ongoing)
     {
-        BTI("g_wifi_pm.bus_suspend_cnt 0\n");
+        //BTI("g_wifi_pm.bus_suspend_cnt 0\n");
         //forbid fw sleep
-        amlbt_aon_addr_bit_set(RG_AON_A24, 25);
+        ret = amlbt_aon_addr_bit_set(RG_AON_A24, 25);
+        if (ret != 0)
+        {
+            goto error;
+        }
         usleep_range(1000, 1000);
         // wake bt fw
 wake_retry:
         if (amlbt_fw_pmu_sleep_get() == TRUE)
         {
             usleep_range(1000, 1000);
-            amlbt_wake_fw();
+            ret = amlbt_wake_fw();
+            if (ret != 0)
+            {
+                goto error;
+            }
         }
         wait_cnt = 0;
-        // wait bt fw wake done
-        while (amlbt_aon_addr_bit_get(RG_AON_A17, 29)) //fw will clear bit after wake done
+        //fw will clear bit after wake done
+        do
         {
+            ret = amlbt_aon_addr_bit_get(RG_AON_A17, 29);
+            if (ret == -1)
+            {
+                goto error;
+            }
             usleep_range(10000, 10000);
             if (wait_cnt++ > 5)//wait 50ms
             {
@@ -1092,17 +1172,19 @@ wake_retry:
                     goto wake_retry;
                 break;
             }
-        }
+        } while (ret);
         amlbt_clear_rclist_from_firmware();
-        ret = 0;
     }
-
+    return ret;
+error:
     return ret;
 }
 
 static int amlbt_suspend_fw(w2l_usb_bt_new_t *p_bt)
 {
     int ret = 0;
+
+    hrtimer_cancel(&p_bt->poll_timer);
 
     ret = amlbt_write_rclist_to_firmware();
     if (ret != 0)
@@ -1123,7 +1205,6 @@ static int amlbt_suspend_fw(w2l_usb_bt_new_t *p_bt)
     }
     return ret;
  err_exit:
-    wake_up_interruptible(&p_bt->rd_wait_queue);
     return ret;
 }
 #if 0
@@ -1210,7 +1291,7 @@ static void amlbt_shutdown_func(void)
     int ret = 0;
     unsigned int retry = 2;
     amlbt_drv_state_clr(BT_DRV_STATE_SUSPEND);
-    BTI("driver state %d amlbt_dev.firmware %d", amlbt_dev.dr_state, amlbt_dev.firmware_start);
+    BTI("driver state %d amlbt_dev.firmware %d", amlbt_dev.dr_state, amlbt_dev.bt_start);
     while (retry)
     {
         ret = amlbt_recy_shutdown_download();
@@ -1296,6 +1377,7 @@ static unsigned int gdsl_write_data_by_ep(gdsl_fifo_t *p_fifo, unsigned char *da
 {
     int ret = 0;
     unsigned long offset = (unsigned long)p_fifo->w;
+    w2l_usb_bt_new_t *p_bt = &amlbt_dev;
 
     BTA("%s len:%d\n", __func__, len);
 
@@ -1303,7 +1385,10 @@ static unsigned int gdsl_write_data_by_ep(gdsl_fifo_t *p_fifo, unsigned char *da
     if (gdsl_fifo_remain(p_fifo) < len)
     {
         BTE("write data no space!!\n");
-        amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
+        if (!(p_bt->dr_state & BT_DRV_STATE_WAIT_RECOVERY))
+        {
+            amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
+        }
         return -1;
     }
 
@@ -1384,6 +1469,14 @@ static void amlbt_res_deinit(w2l_usb_bt_new_t *p_bt)
     unsigned int st_reg = 0;
     BTI("%s \n", __func__);
 
+    hrtimer_cancel(&p_bt->poll_timer);
+    if (p_bt->check_fw_wq != NULL)
+    {
+        flush_workqueue(p_bt->check_fw_wq);
+        destroy_workqueue(p_bt->check_fw_wq);
+        p_bt->check_fw_wq = NULL;
+    }
+
     if (p_bt->usb_rx_buf != NULL)
     {
         kfree(p_bt->usb_rx_buf);
@@ -1400,10 +1493,6 @@ static void amlbt_res_deinit(w2l_usb_bt_new_t *p_bt)
     amlbt_fifo_deinit(&p_bt->fw_data_fifo, p_bt, FIFO_FW_DATA_R, FIFO_FW_DATA_W);
     amlbt_fifo_deinit(&p_bt->_15p4_tx_fifo, p_bt, FIFO_FW_15P4_TX_R, FIFO_FW_15P4_TX_W);
     amlbt_fifo_deinit(&p_bt->_15p4_rx_fifo, p_bt, FIFO_FW_15P4_RX_R, FIFO_FW_15P4_RX_W);
-
-    gdsl_fifo_deinit(p_bt->dr_type_fifo);
-    gdsl_fifo_deinit(p_bt->dr_evt_fifo);
-    gdsl_fifo_deinit(p_bt->dr_data_fifo);
 
     amlbt_fifo_deinit(&p_bt->tx_cmd_fifo, p_bt, FIFO_FW_CMD_R, FIFO_FW_CMD_W);
 
@@ -1423,8 +1512,12 @@ static void amlbt_res_deinit(w2l_usb_bt_new_t *p_bt)
         p_bt->bt_urb = NULL;
     }
 */
+    skb_queue_purge(&p_bt->tx_queue);
+    skb_queue_purge(&p_bt->bt_rx_queue);
+    skb_queue_purge(&p_bt->zigbee_rx_queue);
+    skb_queue_purge(&p_bt->thread_rx_queue);
+    cancel_work_sync(&p_bt->write_work);
     mutex_destroy(&p_bt->bt_debug_mutex);
-    p_bt->firmware_start = 0;
     p_bt->dr_state = 0;
     BTI("%s finished \n", __func__);
 }
@@ -1450,10 +1543,14 @@ static int amlbt_res_init(w2l_usb_bt_new_t *p_bt)
     p_bt->factory = 0;
     p_bt->dr_state = 0;
     p_bt->rd_state = 0;
+    p_bt->zigbee_rd_state = 0;
+    p_bt->thread_rd_state = 0;
     p_bt->sink_mode = 0;
     p_bt->recovery_value= 0;
     p_bt->input_key = 0;
     p_bt->shutdown_value = 0;
+    p_bt->usb_irq_task_quit = 0;
+    p_bt->wait_start = 0;
 
     amlbt_read_word(DRIVER_FW_STATUS, USB_EP2, &st_reg);
     st_reg |= SRAM_FD_INIT_FLAG;
@@ -1485,29 +1582,6 @@ static int amlbt_res_init(w2l_usb_bt_new_t *p_bt)
             FIFO_FW_DATA_R, FIFO_FW_DATA_W))
     {
         BTE("%s:%d fw data fifo init failed!\n", __func__, __LINE__);
-        goto error;
-    }
-    //driver local type fifo init
-    p_bt->dr_type_fifo = gdsl_fifo_init(sizeof(p_bt->dr_type_fifo_buf), p_bt->dr_type_fifo_buf);
-    if (p_bt->dr_type_fifo == NULL)
-    {
-        BTE("%s:%d driver local type fifo init failed!\n", __func__, __LINE__);
-        goto error;
-    }
-
-    //driver local event fifo init
-    p_bt->dr_evt_fifo = gdsl_fifo_init(sizeof(p_bt->dr_evt_fifo_buf), p_bt->dr_evt_fifo_buf);
-    if (p_bt->dr_evt_fifo == NULL)
-    {
-        BTE("%s:%d driver local event fifo init failed!\n", __func__, __LINE__);
-        goto error;
-    }
-
-    //driver local data fifo init
-    p_bt->dr_data_fifo = gdsl_fifo_init(sizeof(p_bt->dr_data_fifo_buf), p_bt->dr_data_fifo_buf);
-    if (p_bt->dr_data_fifo == NULL)
-    {
-        BTE("%s:%d driver local data fifo init failed!\n", __func__, __LINE__);
         goto error;
     }
 
@@ -1554,12 +1628,6 @@ static int amlbt_res_init(w2l_usb_bt_new_t *p_bt)
         BTE("%s:%d fw 15.4 rx fifo init failed!\n", __func__, __LINE__);
         goto error;
     }
-    p_bt->_15p4_dr_fifo = gdsl_fifo_init(sizeof(p_bt->dr_15p4_buf), p_bt->dr_15p4_buf);
-    if (p_bt->_15p4_dr_fifo == NULL)
-    {
-        BTE("%s:%d driver local 15.4 fifo init failed!\n", __func__, __LINE__);
-        goto error;
-    }
 
     st_reg &= ~(SRAM_FD_INIT_FLAG);
     amlbt_write_word(DRIVER_FW_STATUS, st_reg, USB_EP2);
@@ -1571,16 +1639,23 @@ static int amlbt_res_init(w2l_usb_bt_new_t *p_bt)
         goto error;
     }
 */
+    skb_queue_head_init(&p_bt->tx_queue);
+    skb_queue_head_init(&p_bt->bt_rx_queue);
+    skb_queue_head_init(&p_bt->zigbee_rx_queue);
+    skb_queue_head_init(&p_bt->thread_rx_queue);
+    init_waitqueue_head(&p_bt->zigbee_wait_queue);
+    init_waitqueue_head(&p_bt->thread_wait_queue);
+    INIT_WORK(&p_bt->write_work, amlbt_write_work);
+
     mutex_init(&p_bt->bt_debug_mutex);
     init_completion(&p_bt->comp);
-    //init_completion(&p_bt->w_comp);
-    //init_completion(&p_bt->r_comp);
-    sema_init(&p_bt->sr_sem, 1);
     init_waitqueue_head(&p_bt->rd_wait_queue);
-    //if (g_bt_shutdown_func == NULL)
-    //{
-        //g_bt_shutdown_func = amlbt_shutdown_func;
-    //}
+
+    p_bt->check_fw_wq = create_singlethread_workqueue("check_fw_wq");
+    INIT_WORK(&p_bt->check_fw, amlbt_usb_fw_rx_work);
+    hrtimer_init(&p_bt->poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    p_bt->poll_timer.function = amlbt_hrtime;
+
     return 0;
 error:
     amlbt_res_deinit(p_bt);
@@ -1591,12 +1666,14 @@ error:
 static int amlbt_create_device(w2l_usb_bt_new_t *p_bt)
 {
     int ret = 0;
+    int i = 0, j = 0;
     int cdevErr = 0;
-    dev_t dev;
-
+    dev_t dev = 0;
+    const char *device_names[AML_W2LU_MAX_COEX_DEVICES] =
+        { AML_BT_CHAR_DEVICE_NAME, AML_ZIGBEE_NOTE, AML_THREAD_NOTE, AML_COEX_NOTE };
     BTI("%s \n", __func__);
 
-    ret = alloc_chrdev_region(&dev, 0, 1, AML_BT_CHAR_DEVICE_NAME);
+    ret = alloc_chrdev_region(&dev, 0, AML_W2LU_MAX_COEX_DEVICES, AML_BT_CHAR_DEVICE_NAME);
     if (ret)
     {
         BTE("fail to allocate chrdev\n");
@@ -1605,13 +1682,52 @@ static int amlbt_create_device(w2l_usb_bt_new_t *p_bt)
 
     p_bt->dev_major = MAJOR(dev);
     BTI("major number:%d\n", p_bt->dev_major);
-    cdev_init(&p_bt->dev_cdev, &amlbt_fops);
-    p_bt->dev_cdev.owner = THIS_MODULE;
 
-    cdevErr = cdev_add(&p_bt->dev_cdev, dev, 1);
+    i = 0;
+    //bt node
+    cdev_init(&p_bt->dev_cdev[i], &amlbt_fops);
+    p_bt->dev_cdev[i].owner = THIS_MODULE;
+
+    cdevErr = cdev_add(&p_bt->dev_cdev[i], MKDEV(p_bt->dev_major, i), 1);
     if (cdevErr)
     {
-        goto error;
+        goto error_cdev;
+    }
+
+    i++;
+    //zigbee node
+    cdev_init(&p_bt->dev_cdev[i], &amlbt_zigbee_fops);
+    p_bt->dev_cdev[i].owner = THIS_MODULE;
+
+    ret = cdev_add(&p_bt->dev_cdev[i], MKDEV(p_bt->dev_major, i), 1);
+    if (ret)
+    {
+        BTE("cdev_add failed for minor %d\n", i);
+        goto error_cdev;
+    }
+
+    i++;
+    //thread node
+    cdev_init(&p_bt->dev_cdev[i], &amlbt_thread_fops);
+    p_bt->dev_cdev[i].owner = THIS_MODULE;
+
+    ret = cdev_add(&p_bt->dev_cdev[i], MKDEV(p_bt->dev_major, i), 1);
+    if (ret)
+    {
+        BTE("cdev_add failed for minor %d\n", i);
+        goto error_cdev;
+    }
+
+    i++;
+    //coex node
+    cdev_init(&p_bt->dev_cdev[i], &amlbt_coex_fops);
+    p_bt->dev_cdev[i].owner = THIS_MODULE;
+
+    ret = cdev_add(&p_bt->dev_cdev[i], MKDEV(p_bt->dev_major, i), 1);
+    if (ret)
+    {
+        BTE("cdev_add failed for minor %d\n", i);
+        goto error_cdev;
     }
 
     BTI("driver(major %d) installed.\n", p_bt->dev_major);
@@ -1625,14 +1741,17 @@ static int amlbt_create_device(w2l_usb_bt_new_t *p_bt)
     if (IS_ERR(p_bt->dev_class))
     {
         BTE("class create fail, error code(%ld)\n", PTR_ERR(p_bt->dev_class));
-        goto err1;
+        goto error_class;
     }
 
-    p_bt->dev_device = device_create(p_bt->dev_class, NULL, dev, NULL, AML_BT_CHAR_DEVICE_NAME);
-    if (IS_ERR(p_bt->dev_device))
+    for (i = 0; i < AML_W2LU_MAX_COEX_DEVICES; i++)
     {
-        BTE("device create fail, error code(%ld)\n", PTR_ERR(p_bt->dev_device));
-        goto err2;
+        p_bt->dev_device[i] = device_create(p_bt->dev_class, NULL, MKDEV(p_bt->dev_major, i), NULL, device_names[i]);
+        if (IS_ERR(p_bt->dev_device[i]))
+        {
+            BTE("device create fail for %s, error code(%ld)\n", device_names[i], PTR_ERR(p_bt->dev_device[i]));
+            goto error_device;
+        }
     }
 
     BTI("%s: BT_major %d\n", __func__, p_bt->dev_major);
@@ -1640,44 +1759,55 @@ static int amlbt_create_device(w2l_usb_bt_new_t *p_bt)
 
     return 0;
 
-err2:
-    if (p_bt->dev_class)
+error_device:
+    j = i;
+    while (--j >= 0)
     {
-        class_destroy(p_bt->dev_class);
-        p_bt->dev_class = NULL;
+        device_destroy(p_bt->dev_class, MKDEV(p_bt->dev_major, j));
     }
+    class_destroy(p_bt->dev_class);
 
-err1:
-
-error:
-    if (cdevErr == 0)
-        cdev_del(&p_bt->dev_cdev);
-
-    if (ret == 0)
-        unregister_chrdev_region(dev, 1);
+error_class:
+    j = i;
+error_cdev:
+    while (--j >= 0)
+    {
+        cdev_del(&p_bt->dev_cdev[j]);
+    }
+    unregister_chrdev_region(dev, AML_W2LU_MAX_COEX_DEVICES);
 
     return -1;
 }
 
 static int amlbt_destroy_device(w2l_usb_bt_new_t *p_bt)
 {
-    dev_t dev = MKDEV(p_bt->dev_major, 0);
+    dev_t dev;
+    int i;
 
-    BTI("%s dev id %d\n", __func__, dev);
+    BTI("%s: destroying devices\n", __func__);
 
-    if (p_bt->dev_device)
+    for (i = 0; i < AML_W2LU_MAX_COEX_DEVICES; i++)
     {
-        device_destroy(p_bt->dev_class, dev);
-        p_bt->dev_device = NULL;
+        dev = MKDEV(p_bt->dev_major, i);
+        if (p_bt->dev_device[i])
+        {
+            device_destroy(p_bt->dev_class, dev);
+            p_bt->dev_device[i] = NULL;
+        }
     }
+
     if (p_bt->dev_class)
     {
         class_destroy(p_bt->dev_class);
         p_bt->dev_class = NULL;
     }
-    cdev_del(&p_bt->dev_cdev);
 
-    unregister_chrdev_region(dev, 1);
+    for (i = 0; i < AML_W2LU_MAX_COEX_DEVICES; i++)
+    {
+        cdev_del(&p_bt->dev_cdev[i]);
+    }
+
+    unregister_chrdev_region(MKDEV(p_bt->dev_major, 0), AML_W2LU_MAX_COEX_DEVICES);
 
     BTI("%s driver removed.\n", AML_BT_CHAR_DEVICE_NAME);
     return 0;
@@ -1703,7 +1833,12 @@ static void amlbt_unregister_early_suspend(struct platform_device *dev)
 
 static void amlbt_register_wakeupsource(w2l_usb_bt_new_t *p_bt)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+    amlbt_dev.amlbt_wakeup_source = wakeup_source_register("amlbt_wakeup_source");
+#else
     amlbt_dev.amlbt_wakeup_source = wakeup_source_register(NULL, "amlbt_wakeup_source");
+#endif
+
     if (!amlbt_dev.amlbt_wakeup_source)
     {
         BTE("Failed to create wakeup source\n");
@@ -1765,7 +1900,7 @@ static int amlbt_probe(struct platform_device *dev)
 
     amlbt_create_device(&amlbt_dev);
     amlbt_debug_dev_init(amlbt_write_sram, amlbt_read_sram, amlbt_write_word, amlbt_read_word, &amlbt_dev);
-    amlbt_rc_list_init(amlbt_dev.dev_device, amlbt_write_sram, amlbt_read_sram);
+    amlbt_rc_list_init(amlbt_dev.dev_device[0], amlbt_write_sram, amlbt_read_sram);
     amlbt_register_early_suspend(dev);
     amlbt_register_wakeupsource(&amlbt_dev);
     //amlbt_dev->wake_mux = 0;
@@ -1779,7 +1914,11 @@ static int amlbt_probe(struct platform_device *dev)
     return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static int amlbt_remove(struct platform_device *dev)
+#else
+static void amlbt_remove(struct platform_device *dev)
+#endif
 {
     BTI("%s \n", __func__);
 
@@ -1788,7 +1927,7 @@ static int amlbt_remove(struct platform_device *dev)
     amlbt_unregister_wakeupsource(&amlbt_dev);
     amlbt_unregister_early_suspend(dev);
     amlbt_debug_dev_deinit();
-    amlbt_rc_list_deinit(amlbt_dev.dev_device);
+    amlbt_rc_list_deinit(amlbt_dev.dev_device[0]);
     amlbt_destroy_device(&amlbt_dev);
     if (g_cmd_buf != NULL)
     {
@@ -1799,34 +1938,48 @@ static int amlbt_remove(struct platform_device *dev)
     {
         g_bt_shutdown_func = NULL;
     }
-
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
     return 0;
+#endif
 }
 
 static int amlbt_suspend(struct platform_device *dev, pm_message_t state)
 {
-    //unsigned long timeout = msecs_to_jiffies(2000);
+    int wait_cnt = 0;
     int ret = 0;
     w2l_usb_bt_new_t *p_bt = &amlbt_dev;
     p_bt->input_key = 0;
 
-    BTI("%s %#x,%#x\n", __func__, p_bt->firmware_start, p_bt->dr_state);
+    BTI("%s %#x,%#x\n", __func__, p_bt->bt_start, p_bt->dr_state);
 
-    if (p_bt->firmware_start && !(p_bt->dr_state & BT_DRV_STATE_RECOVERY))
+    if (p_bt->bt_start && !(p_bt->dr_state & BT_DRV_STATE_RECOVERY))
     {
-        ret = down_interruptible(&p_bt->sr_sem);
-        if (ret == 0)
+#if 1
+        while (!skb_queue_empty(&p_bt->tx_queue))
         {
-            BTI("%s start\n", __func__);
-            amlbt_drv_state_set(BT_DRV_STATE_SUSPEND_ENTRY);
+            usleep_range(10000, 10000); //wait SENDING 1s
+            wait_cnt++;
+            if (wait_cnt > 100)
+            {
+                BTE("%s:%d suspend failed wait send!\n", __func__, __LINE__);
+                return -EBUSY;
+            }
         }
-        else
+#endif
+        hrtimer_cancel(&p_bt->poll_timer);
+        if (p_bt->check_fw_wq != NULL)
         {
-            /* interrupted, exit */
-            BTE("%s:%d %d wait sr_sem fail!\n", __func__, __LINE__, ret);
-            amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            return -1;
+            flush_workqueue(p_bt->check_fw_wq);
         }
+        amlbt_drv_state_set(BT_DRV_STATE_SUSPEND_ENTRY);
+        ret = amlbt_suspend_fw(p_bt);
+        if (ret != 0)
+        {
+            BTE("%s:%d entery lowpower failed \n", __func__, __LINE__);
+            return -EBUSY;
+        }
+        amlbt_drv_state_set(BT_DRV_STATE_SUSPEND);
+        amlbt_drv_state_clr(BT_DRV_STATE_SUSPEND_ENTRY);
     }
     BTI("%s end\n", __func__);
     return 0;
@@ -1838,14 +1991,12 @@ static int amlbt_resume(struct platform_device *dev)
     int ret = 0;
     w2l_usb_bt_new_t *p_bt = &amlbt_dev;
 
-    BTI("%s %#x,%#x\n", __func__, p_bt->firmware_start, p_bt->dr_state);
+    BTI("%s %#x,%#x\n", __func__, p_bt->bt_start, p_bt->dr_state);
 
-    if (p_bt->firmware_start && !(p_bt->dr_state & BT_DRV_STATE_RECOVERY))
+    if (p_bt->bt_start && !(p_bt->dr_state & BT_DRV_STATE_RECOVERY))
     {
-        ret = down_interruptible(&p_bt->sr_sem);
-        if (ret == 0)
-        {
-            BTI("%s start\n", __func__);
+        amlbt_drv_state_set(BT_DRV_STATE_RESUME);
+        amlbt_drv_state_clr(BT_DRV_STATE_SUSPEND);
 #ifdef  CONFIG_AMLOGIC_GX_SUSPEND
             if (((get_resume_method() != REMOTE_WAKEUP) && (get_resume_method() != BT_WAKEUP))
                                 && (get_resume_method() != REMOTE_CUS_WAKEUP))
@@ -1853,20 +2004,19 @@ static int amlbt_resume(struct platform_device *dev)
                 p_bt->input_key = 1;
             }
 #endif
-            amlbt_drv_state_set(BT_DRV_STATE_RESUME);
-            amlbt_drv_state_clr(BT_DRV_STATE_SUSPEND);
-        }
-        else
+        ret = amlbt_resume_fw(p_bt);
+        if (ret == -1)
         {
-            /* interrupted, exit */
-            BTE("%s:%d %d wait sr_sem fail!\n", __func__, __LINE__, ret);
-            amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            return -1;
+            BTE("%s:%d resume fw failed! \n", __func__, __LINE__);
         }
+        amlbt_drv_state_clr(BT_DRV_STATE_RESUME);
+        p_bt->ktime = ktime_set(0, POLLING_LEVEL_3);
+        p_bt->poll_timer.function = amlbt_hrtime;
+        hrtimer_start(&p_bt->poll_timer, p_bt->ktime, HRTIMER_MODE_REL);
     }
     BTI("WAKE REASON %d\n", get_resume_method());
     BTI("%s end\n", __func__);
-    return 0;
+    return ret;
 }
 
 static void amlbt_shutdown(struct platform_device *dev)
@@ -1887,9 +2037,9 @@ static void amlbt_lateresume(struct early_suspend *h)
     w2l_usb_bt_new_t *p_bt = &amlbt_dev;
     p_bt->input_key = 0;
 
-    BTI("%s %#x,%#x\n", __func__, p_bt->firmware_start, p_bt->dr_state);
+    BTI("%s %#x,%#x\n", __func__, p_bt->bt_start, p_bt->dr_state);
 
-    if (p_bt->firmware_start && !(p_bt->dr_state & BT_DRV_STATE_RECOVERY))
+    if (p_bt->bt_start && !(p_bt->dr_state & BT_DRV_STATE_RECOVERY))
     {
         while (p_bt->dr_state & BT_DRV_RESUME)
         {
@@ -1911,7 +2061,7 @@ static void amlbt_lateresume(struct early_suspend *h)
     }
     BTI("%s end\n", __func__);
 }
-
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
 static int amlbt_bind_bus(void)
 {
     w2l_usb_bt_new_t *p_bt = &amlbt_dev;
@@ -1942,11 +2092,11 @@ static int amlbt_bind_bus(void)
 
 static struct device_link *find_device_link(struct device *consumer, struct device *supplier)
 {
-    struct device_link *link= NULL;
+    struct device_link *link;
 
     list_for_each_entry(link, &consumer->links.suppliers, c_node)
     {
-        if (link != NULL && link->supplier == supplier)
+        if (link->supplier == supplier)
         {
             return link;
         }
@@ -1976,14 +2126,26 @@ static void amlbt_unbind_bus(void)
         p_bt->link = NULL;
     }
 }
-
+#endif
 
 static int amlbt_sw_reset(void)
 {
     int ret = 0;
     ret = amlbt_write_word(REG_DEV_RESET, ((BIT_PHY|BIT_MAC|BIT_CPU)<<16)|(BIT_PHY|BIT_MAC|BIT_CPU), USB_EP2);
+    if (ret != 0)
+    {
+        BTE("%s:%d Failed : %d\n", __func__, __LINE__, ret);
+        goto error;
+    }
     usleep_range(1000, 1000);
     ret = amlbt_write_word(REG_DEV_RESET, ((BIT_CPU)<<16)|(BIT_CPU), USB_EP2);
+    if (ret != 0)
+    {
+        BTE("%s:%d Failed : %d\n", __func__, __LINE__, ret);
+        goto error;
+    }
+    return ret;
+error:
     return ret;
 }
 
@@ -2031,7 +2193,7 @@ static int amlbt_load_conf(w2l_usb_bt_new_t *p_bt)
     size_t len, pos = 0;
 
     BTI("Firmware load:%s\n", AML_BT_CONFIG_NAME);
-    ret = request_firmware(&fw_entry, AML_BT_CONFIG_NAME, p_bt->dev_device);
+    ret = request_firmware(&fw_entry, AML_BT_CONFIG_NAME, p_bt->dev_device[0]);
     if (ret)
     {
         BTE("%s:%d Failed to load config file: %d\n", __func__, __LINE__, ret);
@@ -2186,7 +2348,7 @@ static int amlbt_load_firmware(w2l_usb_bt_new_t *p_bt)
     reg = (p_bt->fw_log & 0x3);
     amlbt_write_word(RG_AON_A59, reg, USB_EP2);
     amlbt_write_word(REG_DEV_RESET, 0, USB_EP2);
-    p_bt->firmware_start = 1;
+    p_bt->bt_start = 1;
     p_bt->iccm_buf = NULL;
     p_bt->dccm_buf = NULL;
     kfree(firmware_data);
@@ -2204,12 +2366,12 @@ static int amlbt_load_firmware(w2l_usb_bt_new_t *p_bt)
     if (!amlbt_ft_mode)
     {
         BTI("Firmware load:%s\n", AML_BT_FIRMWARE_NAME);
-        ret = request_firmware(&fw_entry, AML_BT_FIRMWARE_NAME, p_bt->dev_device);
+        ret = request_firmware(&fw_entry, AML_BT_FIRMWARE_NAME, p_bt->dev_device[0]);
     }
     else
     {
         BTI("Firmware load:%s\n", AML_BT_FIRMWARE_FT_NAME);
-        ret = request_firmware(&fw_entry, AML_BT_FIRMWARE_FT_NAME, p_bt->dev_device);
+        ret = request_firmware(&fw_entry, AML_BT_FIRMWARE_FT_NAME, p_bt->dev_device[0]);
     }
     if (ret)
     {
@@ -2253,7 +2415,7 @@ static int amlbt_load_firmware(w2l_usb_bt_new_t *p_bt)
     amlbt_write_word(RG_AON_A59, reg, USB_EP2);
 
     //amlbt_write_manfdata_to_firmware(p_bt);
-    p_bt->firmware_start = 1;
+    //p_bt->bt_start = 1;
     p_bt->iccm_buf = NULL;
     p_bt->dccm_buf = NULL;
     amlbt_wakeup_unlock();
@@ -2262,17 +2424,59 @@ static int amlbt_load_firmware(w2l_usb_bt_new_t *p_bt)
 }
 #endif
 
+static int amlbt_show_fw_debug_info(void)
+{
+    unsigned int value = 0;
+    int ret = 0;
+
+    ret = amlbt_read_word(REG_PMU_POWER_CFG, USB_EP2, &value);
+    BTI("PMU 0x00f03040:%#x \n", value);
+    if (ret != 0)
+    {
+        goto exit;
+    }
+    usleep_range(10000, 10000);
+    ret = amlbt_read_word(REG_FW_PC, USB_EP2, &value);
+    value = (value >> 6);
+    BTI("pc1 0x200034:%#x\n", value);
+    if (ret != 0)
+    {
+        goto exit;
+    }
+    usleep_range(10000, 10000);
+    ret = amlbt_read_word(REG_FW_PC, USB_EP2, &value);
+    value = (value >> 6);
+    BTI("pc2 0x200034:%#x\n", value);
+    if (ret != 0)
+    {
+        goto exit;
+    }
+    usleep_range(10000, 10000);
+    ret = amlbt_read_word(REG_FW_PC, USB_EP2, &value);
+    value = (value >> 6);
+    BTI("pc3 0x200034:%#x\n", value);
+    if (ret != 0)
+    {
+        goto exit;
+    }
+    return ret;
+exit:
+    return ret;
+}
+
 static int amlbt_open(struct inode *inode, struct file *file)
 {
     int ret = 0;
     BTI("%s,%d, version:%s\n", __func__, amlbt_ft_mode, AML_W2LU_VERSION);
+
+    file->private_data = &amlbt_dev;
 
     ret = amlbt_check_usb();
     if (ret != 0)
     {
         goto err_exit;
     }
-    if (amlbt_ft_mode && amlbt_dev.firmware_start)
+    if (amlbt_ft_mode && amlbt_dev.bt_start)
     {
         file->private_data = &amlbt_dev;
         BTI("%s FT MODE", __func__);
@@ -2280,49 +2484,61 @@ static int amlbt_open(struct inode *inode, struct file *file)
     }
     else
     {
-        ret = amlbt_powersave_clear();
-        if (ret != 0)
+        if (!amlbt_w2lu_coex_is_running(&amlbt_dev))
         {
-            goto err_exit;
+            ret = amlbt_powersave_clear();
+            if (ret != 0)
+            {
+                goto err_exit;
+            }
+
+            if (amlbt_res_init(&amlbt_dev) != 0)
+            {
+                BTI("amlbt_res_init failed!\n");
+                goto err_buf;
+            }
+            //stop bt cpu
+            ret = amlbt_sw_reset();
+            if (ret != 0)
+            {
+                goto err_exit;
+            }
+
+            //amlbt_utils_w2l_usb_init(amlbt_read_word, amlbt_write_word, amlbt_read_sram, amlbt_write_sram);
+            amlbt_load_conf(&amlbt_dev);
+            ret = amlbt_load_firmware(&amlbt_dev);
+            if (ret != 0)
+            {
+                BTI("amlbt_load_firmware failed!\n");
+                goto err_buf;
+            }
+            ret = amlbt_write_word(REG_DEV_RESET, 0, USB_EP2);
+            if (ret != 0)
+            {
+                BTI("start cpu failed!\n");
+                goto err_buf;
+            }
+            ret = amlbt_show_fw_debug_info();
+            if (ret != 0)
+            {
+                BTI("show fw failed!\n");
+                goto err_buf;
+            }
+            amlbt_task_start(&amlbt_dev);
         }
 
-        //stop bt cpu
-        ret = amlbt_sw_reset();
-        if (ret != 0)
-        {
-            goto err_exit;
-        }
-
-        if (amlbt_res_init(&amlbt_dev) != 0)
-        {
-            BTI("amlbt_res_init failed!\n");
-            goto err_buf;
-        }
-        //amlbt_utils_w2l_usb_init(amlbt_read_word, amlbt_write_word, amlbt_read_sram, amlbt_write_sram);
-        amlbt_load_conf(&amlbt_dev);
-        ret = amlbt_load_firmware(&amlbt_dev);
-        if (ret != 0)
-        {
-            BTI("amlbt_load_firmware failed!\n");
-            goto err_buf;
-        }
-        ret = amlbt_write_word(REG_DEV_RESET, 0, USB_EP2);
-        if (ret != 0)
-        {
-            BTI("start cpu failed!\n");
-            goto err_buf;
-        }
-        file->private_data = &amlbt_dev;
-        amlbt_task_start(&amlbt_dev);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
         ret = amlbt_bind_bus();
         if (ret != 0)
         {
             goto err_buf;
         }
+#endif
+        amlbt_dev.bt_start = 1;
         return nonseekable_open(inode, file);
-    err_buf:
+err_buf:
         amlbt_res_deinit(&amlbt_dev);
-    err_exit:
+err_exit:
         return -EIO;
     }
 }
@@ -2337,19 +2553,27 @@ static int amlbt_close(struct inode *inode, struct file *file)
     if (!amlbt_ft_mode)
     {
         amlbt_show_debug();
-        p_bt->usb_irq_task_quit = 1;
-        wait_for_completion(&p_bt->comp);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
         amlbt_unbind_bus();
-        //amlbt_utils_w2l_usb_deinit();
-        ret = amlbt_aon_addr_bit_clr(RG_AON_A24, 26);//wake up firmware, make sure firmware running
-        if (ret != 0)
+#endif
+        if (!p_bt->zigbee_start && !p_bt->thread_start)
         {
-            amlbt_res_deinit(&amlbt_dev);
-            return 0;
-        }
+            amlbt_show_fw_debug_info();
+            p_bt->usb_irq_task_quit = 1;
+            //wait_for_completion(&p_bt->comp);
 
-        amlbt_res_deinit(&amlbt_dev);
-        amlbt_write_word(RG_AON_A15, 0, USB_EP2); //set bt_en auto mode
+            //amlbt_utils_w2l_usb_deinit();
+            ret = amlbt_aon_addr_bit_clr(RG_AON_A24, 26);//wake up firmware, make sure firmware running
+            if (ret != 0)
+            {
+                amlbt_res_deinit(&amlbt_dev);
+                return 0;
+            }
+
+            amlbt_res_deinit(&amlbt_dev);
+            amlbt_write_word(RG_AON_A15, 0, USB_EP2); //set bt_en auto mode
+        }
+        p_bt->bt_start = 0;
     }
 
     BTI("BT closed\n");
@@ -2513,6 +2737,7 @@ static int amlbt_submit_poll_urb(w2l_usb_bt_new_t *p_bt)
     return ret;
 }
 #else
+/*
 static int amlbt_submit_poll_urb(w2l_usb_bt_new_t *p_bt)
 {
     int ret = 0;
@@ -2529,8 +2754,128 @@ static int amlbt_submit_poll_urb(w2l_usb_bt_new_t *p_bt)
     up(&p_bt->usb_irq_sem);
 
     return ret;
-}
+}*/
 #endif
+
+/*
+type 0x04: 1 byte
+head[evt code, length]: 2 bytes
+payload
+*/
+static int amlbt_process_evt_to_skb(w2l_usb_bt_new_t *p_bt, unsigned char *evt_buf, unsigned int len)
+{
+    struct sk_buff *skb = NULL;
+    unsigned int read_len = 0;
+    unsigned int i = 0;
+    unsigned char *p = evt_buf;
+
+    //BTI("process evt %d\n", len);
+
+    while (i < len)
+    {
+        read_len = 3 + p[2];
+        read_len = (read_len + 3) & ~3;
+        skb = alloc_skb(read_len, GFP_KERNEL);
+        if (!skb)
+        {
+            BTE("%s:%d alloc_skb Failed\n", __func__, __LINE__);
+            return -ENOMEM;
+        }
+        //BTI("push evt %d[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", read_len,
+        //    p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+        skb_put_data(skb, p, read_len);
+        skb_queue_tail(&p_bt->bt_rx_queue, skb);
+        p += read_len;
+        i += read_len;
+    }
+    //BTI("process evt end\n");
+    return 0;
+}
+
+/*
+type 0x02: 4 byte
+head[handle 2bytes, length 2bytes]: 4 bytes
+payload
+*/
+static int amlbt_process_data_to_skb(w2l_usb_bt_new_t *p_bt, unsigned char *data_buf, unsigned int len)
+{
+    struct sk_buff *skb = NULL;
+    unsigned int read_len = 0;
+    unsigned int i = 0;
+    unsigned char *p = data_buf;
+
+    //BTI("process data %d\n", len);
+
+    while (i < len)
+    {
+        read_len = 8 + ((p[7] << 8) | (p[6]));
+        read_len = (read_len + 3) & ~3;
+        skb = alloc_skb(read_len, GFP_KERNEL);
+        if (!skb)
+        {
+            BTE("%s:%d alloc_skb Failed\n", __func__, __LINE__);
+            return -ENOMEM;
+        }
+        //BTI("push data %d[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", read_len,
+        //    p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+        skb_put_data(skb, p, read_len);
+        skb_queue_tail(&p_bt->bt_rx_queue, skb);
+        p += read_len;
+        i += read_len;
+    }
+    //BTI("process data end\n");
+    return 0;
+}
+
+/*
+type 0x10: 1 byte
+head[MHDL(zigbee 0xF5, thread 0xFA), MID, length 2bytes]: 4 bytes
+payload + 2 bytes crc
+*/
+static int amlbt_process_15p4_data_to_skb(w2l_usb_bt_new_t *p_bt, unsigned char *data_buf, unsigned int len)
+{
+    struct sk_buff *skb = NULL;
+    unsigned int read_len = 0;
+    unsigned int i = 0;
+    unsigned char *p = data_buf;
+
+    //BTI("process iot %d\n", len);
+
+    while (i < len)
+    {
+        read_len = 7 + ((p[4] << 8) | (p[3]));
+        read_len = (read_len + 3) & ~3;
+        skb = alloc_skb(read_len, GFP_KERNEL);
+        if (!skb)
+        {
+            BTE("%s:%d alloc_skb Failed\n", __func__, __LINE__);
+            return -ENOMEM;
+        }
+        //BTI("push data %d[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", read_len,
+        //    p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+        skb_put_data(skb, p, read_len);
+        if (p[1] == HCI_TYPE_ZIGBEE)
+        {
+#ifdef _15P4_SEPARATION
+            skb_queue_tail(&p_bt->zigbee_rx_queue, skb);
+#else
+            skb_queue_tail(&p_bt->bt_rx_queue, skb);
+#endif
+        }
+        else if (p[1] == HCI_TYPE_THREAD)
+        {
+#ifdef _15P4_SEPARATION
+            skb_queue_tail(&p_bt->thread_rx_queue, skb);
+#else
+            skb_queue_tail(&p_bt->bt_rx_queue, skb);
+#endif
+        }
+        p += read_len;
+        i += read_len;
+    }
+    //BTI("process iot end\n");
+    return 0;
+}
 
 static int amlbt_firmware_data_process(w2l_usb_bt_new_t *p_bt)
 {
@@ -2539,50 +2884,21 @@ static int amlbt_firmware_data_process(w2l_usb_bt_new_t *p_bt)
     unsigned int reg = 0;
     unsigned int type_size = 0;
     unsigned int evt_size = 0;
+    unsigned int data_size = 0;
     unsigned int _15p4_size = 0;
-    unsigned int i = 0;
     unsigned char read_reg[16] = {0};
-    unsigned char *p_data = NULL;
-    unsigned int read_len = 0;
-    unsigned int d_index = 0;
-    unsigned int dropped_data =0;
-    unsigned int m = 0;
-    unsigned long idx = 0;
     unsigned int key_value = 0;
     static unsigned char type_buff[FIFO_FW_RX_TYPE_LEN+4] = {0};
     static unsigned char fw_read_buff[USB_RX_Q_LEN*4] = {0};
+    static unsigned char fw_data_buff[USB_RX_Q_LEN*4] = {0};
+
     int ret = 0;
-    unsigned int fifo_remain = 0;
+
     gdsl_fifo_t ro_fw_evt_fifo = *p_bt->fw_evt_fifo;
     gdsl_fifo_t ro_fw_type_fifo = *p_bt->fw_type_fifo;
-    gdsl_fifo_t ro_dr_data_fifo = *p_bt->dr_data_fifo;
-    gdsl_fifo_t ro_dr_evt_fifo = *p_bt->dr_evt_fifo;
-    gdsl_fifo_t ro_dr_type_fifo = *p_bt->dr_type_fifo;
     gdsl_fifo_t ro_fw_data_fifo = *p_bt->fw_data_fifo;
-    gdsl_fifo_t ro_dr_15p4_fifo = *p_bt->_15p4_dr_fifo;
     gdsl_fifo_t ro_fw_15p4_fifo = *p_bt->_15p4_rx_fifo;
 
-    // check dr fifo full
-    fifo_remain = gdsl_fifo_remain(p_bt->dr_data_fifo);
-    if (fifo_remain < sizeof(p_bt->dr_data_fifo_buf)/4)
-    {
-        BTE("dwf %d %#x, %#x", fifo_remain, (unsigned long)p_bt->dr_data_fifo->w, (unsigned long)p_bt->dr_data_fifo->r);
-        return 0;
-    }
-
-    fifo_remain = gdsl_fifo_remain(p_bt->dr_evt_fifo);
-    if (fifo_remain < sizeof(p_bt->dr_evt_fifo_buf)/4)
-    {
-        BTE("ewf %d %#x, %#x", fifo_remain, (unsigned long)p_bt->dr_evt_fifo->w, (unsigned long)p_bt->dr_evt_fifo->r);
-        return 0;
-    }
-
-    fifo_remain = gdsl_fifo_remain(p_bt->dr_type_fifo);
-    if (fifo_remain < sizeof(p_bt->dr_type_fifo_buf)/4)
-    {
-        BTE("twf %d %#x, %#x", fifo_remain, (unsigned long)p_bt->dr_type_fifo->w, (unsigned long)p_bt->dr_type_fifo->r);
-        return 0;
-    }
 
     //check fw gpio
     if (p_bt->input_key)
@@ -2657,9 +2973,8 @@ static int amlbt_firmware_data_process(w2l_usb_bt_new_t *p_bt)
     if (evt_size)
     {
         p_bt->fw_evt_fifo->r = read_fifo.r;
-        if (-1 == gdsl_fifo_copy_data(p_bt->dr_evt_fifo, fw_read_buff, evt_size))
+        if (0 != amlbt_process_evt_to_skb(p_bt, fw_read_buff, evt_size))
         {
-            amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
             return -1;
         }
     }
@@ -2672,7 +2987,7 @@ static int amlbt_firmware_data_process(w2l_usb_bt_new_t *p_bt)
     //copy data fifo
     if (p_bt->fw_data_fifo->w != p_bt->fw_data_fifo->r)
     {
-        ret = amlbt_read_sram(&fw_read_buff[0],
+        ret = amlbt_read_sram(&fw_data_buff[0],
                                               (unsigned char *)(unsigned long)(FIFO_FW_DATA_ADDR), FIFO_FW_DATA_LEN,
                                               USB_EP2);
         if (ret == -1)
@@ -2685,82 +3000,21 @@ static int amlbt_firmware_data_process(w2l_usb_bt_new_t *p_bt)
             BTE("%s:%d Failed : %d\n", __func__, __LINE__, ret);
             goto err_buf;
         }
+        read_fifo.base_addr = fw_data_buff;
+        read_fifo.r = p_bt->fw_data_fifo->r;
+        read_fifo.w = p_bt->fw_data_fifo->w;
+        read_fifo.size = FIFO_FW_DATA_LEN;
+        data_size = gdsl_fifo_get_data(&read_fifo, fw_read_buff, sizeof(fw_read_buff));
     }
 
-    while (p_bt->fw_data_fifo->w != p_bt->fw_data_fifo->r)
+    if (data_size)
     {
-        idx = (unsigned long)p_bt->fw_data_fifo->r;
-        BTP("data fifo w %#lx, r %#lx\n",(unsigned long)p_bt->fw_data_fifo->w, (unsigned long)p_bt->fw_data_fifo->r);
+        p_bt->fw_data_fifo->r = read_fifo.r;
 
-        p_data = fw_read_buff;
-        read_len = ((p_data[((idx+7)% p_bt->fw_data_fifo->size)] << 8) | (p_data[((idx+6)% p_bt->fw_data_fifo->size)]));
-        read_len = ((read_len + 3) & 0xFFFFFFFC);
-        BTA("D:%d,[%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x]\n", read_len, p_data[((idx)% p_bt->fw_data_fifo->size)],
-            p_data[((idx+1)% p_bt->fw_data_fifo->size)], p_data[((idx+2)% p_bt->fw_data_fifo->size)],
-            p_data[((idx+3)% p_bt->fw_data_fifo->size)], p_data[((idx+4)% p_bt->fw_data_fifo->size)],
-            p_data[((idx+5)% p_bt->fw_data_fifo->size)], p_data[((idx+6)% p_bt->fw_data_fifo->size)],
-            p_data[((idx+7)% p_bt->fw_data_fifo->size)], p_data[((idx+8)% p_bt->fw_data_fifo->size)],
-            p_data[((idx+9)% p_bt->fw_data_fifo->size)], p_data[((idx+10)% p_bt->fw_data_fifo->size)],
-            p_data[((idx+11)% p_bt->fw_data_fifo->size)]);
-        if ((read_len == 0) || (read_len > 1024))
+        if (0 != amlbt_process_data_to_skb(p_bt, fw_read_buff, data_size))
         {
-            d_index = dropped_data;
-            for (m = 0; m < (type_size - 4); m+=4)
-            {
-                if (d_index == i && type_buff[m] == HCI_ACLDATA_PKT)
-                {
-                    type_buff[m] = type_buff[m+4];
-                    d_index += 4;
-                    dropped_data += 4;
-                    continue;
-                }
-                if (d_index > i)
-                {
-                    type_buff[m] = type_buff[m+4];
-                }
-                else if (type_buff[m] == HCI_ACLDATA_PKT)
-                {
-                    d_index += 4;
-                }
-            }
-            type_size -= 4;
-            BTF("data fifo w %#lx, r %#lx\n",(unsigned long)p_bt->fw_data_fifo->w, (unsigned long)p_bt->fw_data_fifo->r);
-            BTF("HEAD1:[%#x,%#x,%#x,%#x]\n",
-                p_data[((idx)% p_bt->fw_data_fifo->size)], p_data[((idx+1)% p_bt->fw_data_fifo->size)],
-                p_data[((idx+2)% p_bt->fw_data_fifo->size)], p_data[((idx+3)% p_bt->fw_data_fifo->size)]);
-            BTF("HEAD2:[%#x,%#x,%#x,%#x]\n",
-                p_data[((idx+4)% p_bt->fw_data_fifo->size)], p_data[((idx+5)% p_bt->fw_data_fifo->size)],
-                p_data[((idx+6)% p_bt->fw_data_fifo->size)], p_data[((idx+7)% p_bt->fw_data_fifo->size)]);
-            BTF("HEAD3:[%#x,%#x,%#x,%#x]\n",
-                p_data[((idx+8)% p_bt->fw_data_fifo->size)],p_data[((idx+9)% p_bt->fw_data_fifo->size)],
-                p_data[((idx+10)% p_bt->fw_data_fifo->size)], p_data[((idx+11)% p_bt->fw_data_fifo->size)]);
-            BTF("HEAD4:[%#x,%#x,%#x,%#x]\n",
-                p_data[((idx+12)% p_bt->fw_data_fifo->size)], p_data[((idx+13)% p_bt->fw_data_fifo->size)],
-                p_data[((idx+14)% p_bt->fw_data_fifo->size)], p_data[((idx+15)% p_bt->fw_data_fifo->size)]);
-            amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            return -EFAULT;
+            return -1;
         }
-
-        if (idx + read_len + 8 < p_bt->fw_data_fifo->size)
-        {
-            if (-1 == gdsl_fifo_copy_data(p_bt->dr_data_fifo, &fw_read_buff[idx], (read_len + 8)))
-            {
-                amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            }
-        }
-        else
-        {
-            if (-1 == gdsl_fifo_copy_data(p_bt->dr_data_fifo, &fw_read_buff[idx], p_bt->fw_data_fifo->size - idx))
-            {
-                amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            }
-            if (-1 == gdsl_fifo_copy_data(p_bt->dr_data_fifo, &fw_read_buff[0],
-                    (read_len + 8) - (p_bt->fw_data_fifo->size - idx)))
-            {
-                amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            }
-        }
-        p_bt->fw_data_fifo->r = (unsigned char *)(((unsigned long)p_bt->fw_data_fifo->r + (read_len + 8)) % p_bt->fw_data_fifo->size);
     }
 
     reg = (((unsigned int)(unsigned long)p_bt->fw_data_fifo->r) & 0x1fff);
@@ -2795,11 +3049,8 @@ static int amlbt_firmware_data_process(w2l_usb_bt_new_t *p_bt)
         if (_15p4_size)
         {
             p_bt->_15p4_rx_fifo->r = read_fifo.r;
-            BTP("15.4 copy:w %#lx, r %#lx, b %#lx,\n", (unsigned long)p_bt->_15p4_dr_fifo->w,
-                (unsigned long)p_bt->_15p4_dr_fifo->r, (unsigned long)p_bt->_15p4_dr_fifo->base_addr);
-            gdsl_fifo_copy_data(p_bt->_15p4_dr_fifo, &fw_read_buff[FIFO_FW_15P4_RX_LEN], _15p4_size);
-            //amlbt_write_word(FIFO_FW_15P4_RX_R, reg, USB_EP2);
             //BTI("15.4 update rx rd %#x\n", amlbt_read_word(FIFO_FW_15P4_RX_R, USB_EP2));
+            amlbt_process_15p4_data_to_skb(p_bt, &fw_read_buff[FIFO_FW_15P4_RX_LEN], _15p4_size);
         }
     }
 
@@ -2820,25 +3071,25 @@ static int amlbt_firmware_data_process(w2l_usb_bt_new_t *p_bt)
         BTE("%s:%d Failed : %d\n", __func__, __LINE__, ret);
         goto err_buf;
     }
-    if (-1 == gdsl_fifo_copy_data(p_bt->dr_type_fifo, type_buff, type_size))
+
+    if (!skb_queue_empty(&p_bt->bt_rx_queue))
     {
-        amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-        return -1;
+        wake_up_interruptible(&p_bt->rd_wait_queue);
     }
-    BTD("dp2 type:w %#lx, r %#lx\n", (unsigned long)p_bt->dr_type_fifo->w, (unsigned long)p_bt->dr_type_fifo->r);
-    BTD("dp2 evt:w %#lx, r %#lx\n", (unsigned long)p_bt->dr_evt_fifo->w, (unsigned long)p_bt->dr_evt_fifo->r);
-    BTD("dp2 data:w %#lx, r %#lx\n", (unsigned long)p_bt->dr_data_fifo->w, (unsigned long)p_bt->dr_data_fifo->r);
-    wake_up_interruptible(&p_bt->rd_wait_queue);
+    if (!skb_queue_empty(&p_bt->zigbee_rx_queue))
+    {
+        wake_up_interruptible(&p_bt->zigbee_wait_queue);
+    }
+    if (!skb_queue_empty(&p_bt->thread_rx_queue))
+    {
+        wake_up_interruptible(&p_bt->thread_wait_queue);
+    }
 
     return 0;
 err_buf:
     *p_bt->fw_evt_fifo = ro_fw_evt_fifo;
     *p_bt->fw_type_fifo =  ro_fw_type_fifo;
-    *p_bt->dr_data_fifo = ro_dr_data_fifo;
-    *p_bt->dr_evt_fifo= ro_dr_evt_fifo;
-    *p_bt->dr_type_fifo = ro_dr_type_fifo;
     *p_bt->fw_data_fifo = ro_fw_data_fifo;
-    *p_bt->_15p4_dr_fifo = ro_dr_15p4_fifo;
     *p_bt->_15p4_rx_fifo = ro_fw_15p4_fifo;
     return -2;
 err_exit:
@@ -2849,64 +3100,70 @@ static int amlbt_drv_state_process(w2l_usb_bt_new_t *p_bt)
 {
     int ret = BT_DRV_NONE;
 
+    if (p_bt->dr_state & BT_DRV_STATE_WAIT_RECOVERY)
+    {
+        if (bus_state_detect.bus_err || \
+                bus_state_detect.bus_reset_ongoing || \
+                    bus_state_detect.is_recy_ongoing || \
+                        (enum usb_udev_state)g_udev->state != USB_CONFIGURED)
+        {
+            if ((sched_clock() - p_bt->wait_start) >= MAX_TIMEOUT)
+            {
+                BTE("%s bus_err %d reset %d recy %d udev %d", __func__, bus_state_detect.bus_err, bus_state_detect.bus_reset_ongoing,
+                    bus_state_detect.is_recy_ongoing, g_udev->state);
+            }
+        }
+        else
+        {
+            amlbt_wakeup_lock();
+            amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
+            amlbt_drv_state_clr(BT_DRV_STATE_WAIT_RECOVERY);
+        }
+        ret = BT_DRV_WAIT_RECOVERY;
+        goto exit;
+    }
+
     if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
     {
         p_bt->usb_irq_task_quit = 1;
-        wake_up_interruptible(&p_bt->rd_wait_queue);
+        if (p_bt->bt_start)
+        {
+            wake_up_interruptible(&p_bt->rd_wait_queue);
+        }
+        if (p_bt->zigbee_start)
+        {
+            wake_up_interruptible(&p_bt->zigbee_wait_queue);
+        }
+        if (p_bt->thread_start)
+        {
+            wake_up_interruptible(&p_bt->thread_wait_queue);
+        }
     }
 
     if (p_bt->usb_irq_task_quit)
     {
         BTW("%s:%d usb_irq_task_quit == 1!\n", __func__, __LINE__);
-        complete(&p_bt->comp);
+        //complete(&p_bt->comp);
         ret = BT_DRV_CLOSED;
         goto exit;
     }
 
-    if (p_bt->dr_state & BT_DRV_STATE_SUSPEND_ENTRY)
-    {
-        BTW("%s:%d BT_DRV_STATE_SUSPEND_ENTRY!\n", __func__, __LINE__);
-        if (0 == amlbt_suspend_fw(p_bt))
-        {
-            amlbt_drv_state_clr(BT_DRV_STATE_SUSPEND_ENTRY);
-            amlbt_drv_state_set(BT_DRV_STATE_SUSPEND);
-            ret = BT_DRV_SUSPEND;
-        }
-        else
-        {
-            amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            amlbt_drv_state_clr(BT_DRV_STATE_SUSPEND_ENTRY);
-            ret = BT_DRV_CLOSED;
-        }
-        up(&p_bt->sr_sem);
-        goto exit;
-    }
-
-    if (p_bt->dr_state & BT_DRV_STATE_SUSPEND)
+    if ((p_bt->dr_state & BT_DRV_STATE_SUSPEND_ENTRY) || \
+           (p_bt->dr_state & BT_DRV_STATE_SUSPEND))
     {
         ret = BT_DRV_SUSPEND;
         goto exit;
     }
-
     if (p_bt->dr_state & BT_DRV_STATE_RESUME)
     {
-        BTW("%s:%d BT_DRV_STATE_RESUME_ENTRY!\n", __func__, __LINE__);
-        if (0 == amlbt_resume_fw())
-        {
-            amlbt_drv_state_clr(BT_DRV_STATE_RESUME);
-            ret = BT_DRV_NONE;
-            up(&p_bt->sr_sem);
-            goto exit;
-        }
-        else
-        {
-            ret = BT_DRV_RESUME;
-        }
+        ret = BT_DRV_RESUME;
+        goto exit;
     }
 exit:
     return ret;
 }
 
+#if 0
 static void amlbt_polling_time_check(w2l_usb_bt_new_t *p_bt)
 {
     if (p_bt->sink_mode)
@@ -3012,6 +3269,112 @@ static int amlbt_task_start(w2l_usb_bt_new_t *p_bt)
     reinit_completion(&p_bt->comp);
     return amlbt_submit_poll_urb(p_bt);
 }
+#else
+
+static enum hrtimer_restart amlbt_hrtime(struct hrtimer *timer)
+{
+    w2l_usb_bt_new_t *p_bt = &amlbt_dev;
+
+    if (p_bt->sink_mode)
+    {
+        p_bt->ktime = ktime_set(0, POLLING_LEVEL_1);
+    }
+    else
+    {
+        p_bt->ktime = ktime_set(0, POLLING_LEVEL_3);
+    }
+
+    queue_work(p_bt->check_fw_wq, &p_bt->check_fw);
+    hrtimer_start(timer, p_bt->ktime, HRTIMER_MODE_REL);
+
+    return HRTIMER_RESTART;
+}
+
+
+static void amlbt_usb_fw_rx_work(struct work_struct *work)
+{
+    w2l_usb_bt_new_t *p_bt = &amlbt_dev;
+    //process data
+    int actual_length = 0;
+    int ret = 0;
+    int err = 0;
+    unsigned char *data;
+
+    if (p_bt->dr_state == 0)
+    {
+        mutex_lock(&p_bt->bt_debug_mutex);
+        ret = amlbt_read_sram(p_bt->usb_rx_buf, (unsigned char *)(unsigned long)HI_USB_EVENT_Q_ADDR, POLL_TOTAL_LEN, USB_EP2);
+        if (ret != 0)
+        {
+            BTE("%s:%d Failed : %d\n", __func__, __LINE__, ret);
+            p_bt->usb_rx_len = 0;
+            mutex_unlock(&p_bt->bt_debug_mutex);
+            if (err == -1)
+            {
+                BTE("%s:%d Failed : %d\n", __func__, __LINE__, err);
+                if (!(p_bt->dr_state & BT_DRV_STATE_WAIT_RECOVERY))
+                {
+                    amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
+                    //complete(&p_bt->comp);
+                    wake_up_interruptible(&p_bt->rd_wait_queue);
+                }
+                return ;
+            }
+        }
+        p_bt->usb_rx_len = POLL_TOTAL_LEN;
+        mutex_unlock(&p_bt->bt_debug_mutex);
+    }
+    else
+    {
+        p_bt->usb_rx_len = 0;
+    }
+
+    ret = amlbt_drv_state_process(p_bt);
+
+    if (ret == BT_DRV_NONE)
+    {
+        data = p_bt->usb_rx_buf;
+        actual_length = p_bt->usb_rx_len;
+        if (actual_length == POLL_TOTAL_LEN)
+        {
+            mutex_lock(&p_bt->bt_debug_mutex);
+            err = amlbt_firmware_data_process(p_bt);
+            mutex_unlock(&p_bt->bt_debug_mutex);
+            if (err == -1)
+            {
+                BTE("%s:%d Failed : %d\n", __func__, __LINE__, err);
+                if (!(p_bt->dr_state & BT_DRV_STATE_WAIT_RECOVERY))
+                {
+                    amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
+                    //complete(&p_bt->comp);
+                    wake_up_interruptible(&p_bt->rd_wait_queue);
+                }
+                return ;
+            }
+        }
+        else
+        {
+            BTE("%s:%d usb rx data length not match!!, %d\n", __func__, __LINE__, actual_length);
+        }
+        p_bt->usb_rx_len = 0;
+    }
+    else if (ret == BT_DRV_CLOSED)
+    {
+        BTW("%s:%d BT_DRV_CLOSED!\n", __func__, __LINE__);
+    }
+    else if (ret == BT_DRV_SUSPEND || ret == BT_DRV_RESUME || ret == BT_DRV_WAIT_RECOVERY)
+    {
+        BTA("%s:%d BT_DRV_SUSPEND or BT_DRV_RESUME or BT_DRV_WAIT_RECOVERY!\n", __func__, __LINE__);
+    }
+}
+
+static int amlbt_task_start(w2l_usb_bt_new_t *p_bt)
+{
+    p_bt->ktime = ktime_set(0, POLLING_LEVEL_3); // 8 millisecond
+    hrtimer_start(&p_bt->poll_timer, p_bt->ktime, HRTIMER_MODE_REL);
+    return 0;
+}
+#endif
 
 static int amlbt_download_firmware(w2l_usb_bt_new_t *p_bt)
 {
@@ -3114,11 +3477,24 @@ error:
     return ret;
 }
 
+static unsigned int amlbt_w2lu_coex_is_running(w2l_usb_bt_new_t *p_bt)
+{
+    BTI("%s, %#x, %#x, %#x\n", __func__, p_bt->bt_start, p_bt->zigbee_start, p_bt->thread_start);
+
+    if (p_bt->bt_start || p_bt->zigbee_start || p_bt->thread_start)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+
 static int amlbt_send_hci_cmd(w2l_usb_bt_new_t *p_bt, unsigned char *data, unsigned int len)
 {
     int ret = 0;
     unsigned int val = 0;
-    gdsl_fifo_t t_fifo = *p_bt->tx_cmd_fifo;
+    gdsl_fifo_t t_fifo;
     BTA("%s, len %d \n", __func__, len);
 
     if (p_bt->tx_cmd_fifo == NULL)
@@ -3126,6 +3502,7 @@ static int amlbt_send_hci_cmd(w2l_usb_bt_new_t *p_bt, unsigned char *data, unsig
         BTE("%s: p_bt->tx_cmd_fifo NULL!!!!\n", __func__);
         goto err_exit;
     }
+    t_fifo = *p_bt->tx_cmd_fifo;
 
     len = ((len + 3) & 0xFFFFFFFC);//Keep 4 bytes aligned
     BTA("%s, Actual length %d \n", __func__, len);
@@ -3304,7 +3681,7 @@ static int amlbt_send_15p4_data(w2l_usb_bt_new_t *p_bt,unsigned char *data, unsi
 {
     int ret = 0;
     unsigned int val = 0;
-    gdsl_fifo_t p_fifo = *p_bt->_15p4_tx_fifo;
+    gdsl_fifo_t p_fifo;
     BTP("%s, len %d \n", __func__, len);
 
     if (p_bt->_15p4_tx_fifo == NULL)
@@ -3312,6 +3689,7 @@ static int amlbt_send_15p4_data(w2l_usb_bt_new_t *p_bt,unsigned char *data, unsi
         BTE("%s: p_bt->_15p4_tx_fifo NULL!!!!\n", __func__);
         return -1;
     }
+    p_fifo = *p_bt->_15p4_tx_fifo;
 
     len = ((len + 3) & 0xFFFFFFFC);//Keep 4 bytes aligned
 
@@ -3356,12 +3734,11 @@ static ssize_t amlbt_write(struct file *file_p,
                                      size_t count,
                                      loff_t *pos_p)
 {
-    int ret = 0;
-    int wait_cnt = 0;
     int i = 0;
     static unsigned int w_type = 0;
     w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file_p->private_data;
-    static unsigned char hci_buf[HCI_MAX_FRAME_SIZE] = {0};
+    struct sk_buff *skb;
+    unsigned char *p;
 
     BTA("%s, count:%ld\n", __func__, count);
 
@@ -3377,79 +3754,61 @@ static ssize_t amlbt_write(struct file *file_p,
         return count;
     }
 
-    if (!p_bt->firmware_start)
+    if (!p_bt->bt_start)
     {
-        BTE("%s:%d p_bt->firmware_start == 0!\n", __func__, __LINE__);
+        BTE("%s:%d p_bt->bt_start == 0!\n", __func__, __LINE__);
         return -EINVAL;
     }
 
-    if (copy_from_user(hci_buf, buf_p, count))
+    skb = alloc_skb(count+1, GFP_KERNEL);
+    if (!skb)
     {
+        return -ENOMEM;
+    }
+
+    *(unsigned char *)skb_put(skb, 1) = w_type;
+
+    if (copy_from_user(skb_put(skb, count), buf_p, count))
+    {
+        kfree_skb(skb);
         BTE("%s: Failed to get data from user space\n", __func__);
         return -EFAULT;
     }
-
-    if (count > 1 && w_type == HCI_COMMAND_PKT)
-    {
-        BTP("hci cmd:[%#x,%#x,%#x,%#x]",
-            hci_buf[0],hci_buf[1],hci_buf[2],hci_buf[3]);
-    }
-
-    while ((p_bt->dr_state & BT_DRV_STATE_SUSPEND) || (p_bt->dr_state & BT_DRV_STATE_RESUME))
-    {
-        usleep_range(20000, 20000);
-        if (wait_cnt++ >= 100)
-        {
-            BTE("cmd timeout [%#x %#x]", hci_buf[0], hci_buf[1]);
-            break;
-        }
-    }
+#ifndef _15P4_SEPARATION
+    //p = &skb->data[0];
+    //if (w_type == HCI_15P4_PKT)
+    //{
+    //    BTI("write 15.4 %d, %d:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", skb->len, count,
+    //            p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+    //}
+#endif
+    p = &skb->data[1];
 
     if (w_type == HCI_COMMAND_PKT)
     {
-        if (count == 0x0f && hci_buf[0] == 0x27 && hci_buf[1] == 0xfc)   //close
+        if (count == 0x0f && p[0] == 0x27 && p[1] == 0xfc)   //close
         {
             BTP("close cmd:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]",
-                hci_buf[0],hci_buf[1],hci_buf[2],hci_buf[3],
-                hci_buf[4],hci_buf[5],hci_buf[6],hci_buf[7]);
+                p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
             BTW("bluetooth close!\n");
+            kfree_skb(skb);
             return count;
         }
-        if (hci_buf[0] == 0x05 && hci_buf[1] == 0x14)    // read rssi
+        if (p[0] == 0x05 && p[1] == 0x14)    // read rssi
         {
             BTI("rs\n");
         }
-        if (hci_buf[0] == 0x1a && hci_buf[1] == 0xfc)
+        if (p[0] == 0x1a && p[1] == 0xfc)
         {
             for (; i < sizeof(p_bt->mac_addr); i++)
             {
-                p_bt->mac_addr[i] = hci_buf[i+3];
+                p_bt->mac_addr[i] = p[i+3];
             }
         }
-        //amlbt_drv_state_set(BT_DRV_STATE_SEND);
-        //wait_for_completion(&p_bt->w_comp);
-        ret = amlbt_send_hci_cmd(p_bt, hci_buf, count);
-        //amlbt_drv_state_clr(BT_DRV_STATE_SEND);
-        //complete(&p_bt->r_comp);
-    }
-    else if (w_type == HCI_ACLDATA_PKT)
-    {
-        //amlbt_drv_state_set(BT_DRV_STATE_SEND);
-        //wait_for_completion(&p_bt->w_comp);
-        ret = amlbt_send_hci_data(p_bt, hci_buf, count);
-        //amlbt_drv_state_clr(BT_DRV_STATE_SEND);
-        //complete(&p_bt->r_comp);
-    }
-    else if (w_type == HCI_15P4_PKT)
-    {
-        ret = amlbt_send_15p4_data(p_bt, hci_buf, count);
     }
 
-    if (ret != 0)
-    {
-        BTE("%s:%d Failed : %d\n", __func__, __LINE__, ret);
-        return 0;
-    }
+    skb_queue_tail(&p_bt->tx_queue, skb);
+    schedule_work(&p_bt->write_work);
 
     return count;
 }
@@ -3459,29 +3818,22 @@ static ssize_t amlbt_read(struct file *file_p,
                                    size_t count,
                                    loff_t *pos_p)
 {
-    //unsigned char close_evt[7] = {0x04, 0x0e, 0x04, 0x01, 0x27, 0xfc, 0x00};
     unsigned char hw_error_evt[5] = {0x04, 0x10, 0x01, 0x00, 0x00};
     w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file_p->private_data;
-    static unsigned char bt_type[4] = {0};
-    static unsigned char hci_read_buf[USB_TX_Q_LEN+64] = {0};
-    unsigned int read_len = 0;
-    unsigned int type_size = 0;
+    static struct sk_buff *skb;
+    unsigned char *p = NULL;
 
-    if (!p_bt->firmware_start)
+    if (!p_bt->bt_start)
     {
-        BTE("%s:%d p_bt->firmware_start == 0!\n", __func__, __LINE__);
+        BTE("%s:%d p_bt->bt_start == 0!\n", __func__, __LINE__);
         return -EFAULT;
     }
 
-    BTD("rd %#x\n", p_bt->rd_state);
-    BTD("rd type:w %#lx, r %#lx\n", (unsigned long)p_bt->dr_type_fifo->w, (unsigned long)p_bt->dr_type_fifo->r);
-    BTD("rd evt:w %#lx, r %#lx\n", (unsigned long)p_bt->dr_evt_fifo->w, (unsigned long)p_bt->dr_evt_fifo->r);
-    BTD("rd data:w %#lx, r %#lx\n", (unsigned long)p_bt->dr_data_fifo->w, (unsigned long)p_bt->dr_data_fifo->r);
+    BTD("rd %#x, count %d\n", p_bt->rd_state, count);
 
     switch (p_bt->rd_state)
     {
         case HCI_RX_TYPE:   //read type
-            memset(bt_type, 0, sizeof(bt_type));
             if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
             {
                 BTW("%s:%d BT_DRV_STATE_RECOVERY!\n", __func__, __LINE__);
@@ -3491,141 +3843,112 @@ static ssize_t amlbt_read(struct file *file_p,
                     return -EFAULT;
                 }
                 p_bt->rd_state = HCI_RX_HEADER;
-                bt_type[0] = HCI_EVENT_PKT;
                 return count;
             }
-            type_size = gdsl_fifo_get_data(p_bt->dr_type_fifo, bt_type, sizeof(bt_type));
-            if (0 == type_size)
+            skb = skb_dequeue(&p_bt->bt_rx_queue);
+            if (!skb)
             {
-                BTE("%s:%d p_bt->dr_type_fifo NULL!\n", __func__, __LINE__);
+                BTE("zb HCI_RX_TYPE no data!\n");
+                return 0;
+            }
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
                 return -EFAULT;
             }
-            BTD("tp(%#x,%#x,%#x,%#x)\n", bt_type[0],bt_type[1],bt_type[2],bt_type[3]);
-            if (bt_type[0] != HCI_ACLDATA_PKT && bt_type[0] != HCI_EVENT_PKT && bt_type[0] != HCI_15P4_PKT)
-            {
-                BTE("TYPE size %#x ERROR (%#x,%#x,%#x,%#x)\n", type_size, bt_type[0],bt_type[1],bt_type[2],bt_type[3]);
-                BTE("g_fw_type_fifo->w:%#x g_fw_type_fifo->r:%#x\n", p_bt->fw_type_fifo->w, p_bt->fw_type_fifo->r);
-                BTE("g_fw_evt_fifo->w:%#x g_fw_evt_fifo->r:%#x\n", p_bt->fw_evt_fifo->w, p_bt->fw_evt_fifo->r);
-                BTE("g_fw_data_fifo->w:%#x g_fw_data_fifo->r:%#x\n", p_bt->dr_data_fifo->w, p_bt->dr_data_fifo->r);
-                return -EFAULT;
-            }
-            if (copy_to_user(buf_p, bt_type, count))
+            if (copy_to_user(buf_p, skb->data, count))
             {
                 BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            p = skb->data;
+#ifdef _15P4_SEPARATION
+            if (p[0] == HCI_EVENT_PKT)
+#else
+            if (p[0] == HCI_EVENT_PKT || p[0] == HCI_15P4_PKT)
+#endif
+            {
+                if (amlbt_debug_filter_event(p) == 0)
+                {
+                    amlbt_debug_get_event((unsigned int)p_bt->fw_evt_fifo->w, (unsigned int)p_bt->fw_evt_fifo->r, p);
+                }
+                skb_pull(skb, count);
+            }
+            else if (p[0] == HCI_ACLDATA_PKT)
+            {
+                skb_pull(skb, 4);
+            }
+            else
+            {
+                BTE("%s, bt type error! \n", __func__);
                 return -EFAULT;
             }
             p_bt->rd_state = HCI_RX_HEADER;
         break;
         case HCI_RX_HEADER: // read header
-            if (bt_type[0] == HCI_EVENT_PKT)
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
             {
-                if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
-                {
-                    if (copy_to_user(buf_p, &hw_error_evt[1], count))
-                    {
-                        BTE("%s, copy_to_user error \n", __func__);
-                        return -EFAULT;
-                    }
-                    p_bt->rd_state = HCI_RX_PAYLOAD;
-                    return count;
-                }
-                gdsl_fifo_get_data(p_bt->dr_evt_fifo, hci_read_buf, 4);
-                if (copy_to_user(buf_p, &hci_read_buf[1], count))
+                if (copy_to_user(buf_p, &hw_error_evt[1], count))
                 {
                     BTE("%s, copy_to_user error \n", __func__);
                     return -EFAULT;
                 }
-                BTD("E:%#x|%#x|%#x|%#x\n", hci_read_buf[0], hci_read_buf[1],
-                       hci_read_buf[2], hci_read_buf[3]);
+                p_bt->rd_state = HCI_RX_PAYLOAD;
+                return count;
             }
-            else if (bt_type[0] == HCI_ACLDATA_PKT)
+
+            if (skb->len < count)
             {
-                gdsl_fifo_get_data(p_bt->dr_data_fifo, hci_read_buf, 8);
-                BTD("D:%#x|%#x|%#x|%#x\n", hci_read_buf[0], hci_read_buf[1],
-                       hci_read_buf[2], hci_read_buf[3]);
-                if (copy_to_user(buf_p, &hci_read_buf[4], count))
-                {
-                    BTE("%s, copy_to_user error \n", __func__);
-                    return -EFAULT;
-                }
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
             }
-            else if (bt_type[0] == HCI_15P4_PKT)
+            if (copy_to_user(buf_p, skb->data, count))
             {
-                gdsl_fifo_get_data(p_bt->_15p4_dr_fifo, hci_read_buf, 5);
-                read_len = ((7 + ((hci_read_buf[4] << 8) | (hci_read_buf[3])) + 3) & 0xFFFFFFFC);
-                gdsl_fifo_get_data(p_bt->_15p4_dr_fifo, &hci_read_buf[5], read_len - 5);
-                BTP("15.4 read len %d\n", read_len);
-                BTP("15.4 header:%#x|%#x|%#x|%#x|%#x\n", hci_read_buf[0], hci_read_buf[1],
-                       hci_read_buf[2], hci_read_buf[3], hci_read_buf[4]);
-                BTP("15.4 local:w %#lx, r %#lx\n", (unsigned long)p_bt->_15p4_dr_fifo->w, (unsigned long)p_bt->_15p4_dr_fifo->r);
-                if (copy_to_user(buf_p, &hci_read_buf[1], count))
-                {
-                    BTE("%s, copy_to_user error \n", __func__);
-                    return -EFAULT;
-                }
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->rd_state = HCI_RX_TYPE;
+                return -EFAULT;
             }
-            p_bt->rd_state = HCI_RX_PAYLOAD;
+            skb_pull(skb, count);
+            if (skb->len == 0)
+            {
+                kfree_skb(skb);
+                p_bt->rd_state = HCI_RX_TYPE;
+            }
+            else
+            {
+                p_bt->rd_state = HCI_RX_PAYLOAD;
+            }
         break;
         case HCI_RX_PAYLOAD:    //read payload
-            if (bt_type[0] == HCI_EVENT_PKT)
+
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
             {
-                if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
-                {
-                    if (copy_to_user(buf_p, &hw_error_evt[3], count))
-                    {
-                        BTE("%s, copy_to_user error \n", __func__);
-                        return -EFAULT;
-                    }
-                    p_bt->rd_state = HCI_RX_FATAL;
-                    return count;
-                }
-                read_len = hci_read_buf[2];
-                read_len -= 1;
-                read_len = ((read_len + 3) & 0xFFFFFFFC);
-                gdsl_fifo_get_data(p_bt->dr_evt_fifo, &hci_read_buf[4], read_len);
-                if (hci_read_buf[1] != 0x3e && hci_read_buf[1] != 0x2f)
-                {
-                    BTP("E:[%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x]\n", hci_read_buf[0], hci_read_buf[1],
-                           hci_read_buf[2], hci_read_buf[3],hci_read_buf[4], hci_read_buf[5],
-                           hci_read_buf[6], hci_read_buf[7]);
-                }
-                if (amlbt_debug_filter_event(hci_read_buf) == 0)
-                {
-                    amlbt_debug_get_event((unsigned int)(unsigned long)(p_bt->dr_evt_fifo->w),
-                                            (unsigned int)(unsigned long)(p_bt->dr_evt_fifo->r), hci_read_buf);
-                }
-                if (copy_to_user(buf_p, &hci_read_buf[3], count))
+                if (copy_to_user(buf_p, &hw_error_evt[3], count))
                 {
                     BTE("%s, copy_to_user error \n", __func__);
                     return -EFAULT;
                 }
+                p_bt->rd_state = HCI_RX_FATAL;
+                p_bt->bt_start = 0;
+                return count;
             }
-            else if (bt_type[0] == HCI_ACLDATA_PKT)
+
+            if (skb->len < count)
             {
-                read_len = ((hci_read_buf[7] << 8) | (hci_read_buf[6]));
-                read_len = ((read_len + 3) & 0xFFFFFFFC);
-                gdsl_fifo_get_data(p_bt->dr_data_fifo, &hci_read_buf[8], read_len);
-                BTP("D:%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x\n", hci_read_buf[4], hci_read_buf[5],
-                       hci_read_buf[6], hci_read_buf[7], hci_read_buf[8],
-                       hci_read_buf[9], hci_read_buf[10], hci_read_buf[11]);
-                if (copy_to_user(buf_p, &hci_read_buf[8], count))
-                {
-                    BTE("%s, copy_to_user error \n", __func__);
-                    return -EFAULT;
-                }
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
             }
-            else if (bt_type[0] == HCI_15P4_PKT)
+            if (copy_to_user(buf_p, skb->data, count))
             {
-                BTP("15.4 read payload len %d\n", count);
-                BTP("15.4 payload:[%#x|%#x|%#x|%#x|%#x|%#x|%#x|%#x]\n", hci_read_buf[5], hci_read_buf[6],
-                       hci_read_buf[7], hci_read_buf[8]);
-                BTP("15.4 get:w %#lx, r %#lx\n", (unsigned long)p_bt->_15p4_dr_fifo->w, (unsigned long)p_bt->_15p4_dr_fifo->r);
-                if (copy_to_user(buf_p, &hci_read_buf[5], count))
-                {
-                    BTE("%s, copy_to_user error \n", __func__);
-                    return -EFAULT;
-                }
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->rd_state = HCI_RX_TYPE;
+                return -EFAULT;
             }
+            kfree_skb(skb);
             p_bt->rd_state = HCI_RX_TYPE;
             break;
         default:
@@ -3635,14 +3958,14 @@ static ssize_t amlbt_read(struct file *file_p,
     return count;
 }
 
-unsigned int amlbt_poll(struct file *file, poll_table *wait)
+static unsigned int amlbt_poll(struct file *file, poll_table *wait)
 {
     int mask = 0;
     w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file->private_data;
 
     poll_wait(file, &p_bt->rd_wait_queue, wait);
 
-    if (!p_bt->firmware_start)
+    if (!p_bt->bt_start)
     {
         mask |= POLLIN | POLLRDNORM;
         goto exit;
@@ -3659,40 +3982,16 @@ unsigned int amlbt_poll(struct file *file, poll_table *wait)
         goto exit;
     }
 
-    if (p_bt->rd_state > HCI_RX_TYPE)
-    {
-        mask |= POLLIN | POLLRDNORM;
-        goto exit;
-    }
-
     if ((g_udev == NULL) || bus_state_detect.bus_err || bus_state_detect.bus_reset_ongoing)
     {
         BTF("%s:%d usb error!, %#x,%#x\n", __func__, __LINE__, bus_state_detect.bus_err, bus_state_detect.bus_reset_ongoing);
         goto exit;
     }
-    else if(p_bt->dr_type_fifo->r != p_bt->dr_type_fifo->w)
+
+    if (p_bt->rd_state > HCI_RX_TYPE || skb_queue_len(&p_bt->bt_rx_queue) > 0)
     {
-        if (p_bt->dr_evt_fifo->r != p_bt->dr_evt_fifo->w)
-        {
-            mask |= POLLIN | POLLRDNORM;
-        }
-        else if (p_bt->dr_data_fifo->r != p_bt->dr_data_fifo->w)
-        {
-            mask |= POLLIN | POLLRDNORM;
-        }
-        else if (p_bt->_15p4_dr_fifo->r != p_bt->_15p4_dr_fifo->w)
-        {
-            mask |= POLLIN | POLLRDNORM;
-        }
-        else
-        {
-            BTF("%s nodata type fifo:w %#lx, r %#lx\n", __func__,
-                (unsigned long)p_bt->dr_type_fifo->w, (unsigned long)p_bt->dr_type_fifo->r);
-            BTF("%s nodata evt fifo:w %#lx, r %#lx\n", __func__,
-                (unsigned long)p_bt->dr_evt_fifo->w, (unsigned long)p_bt->dr_evt_fifo->r);
-            BTF("%s nodata data fifo:w %#lx, r %#lx\n", __func__,
-                (unsigned long)p_bt->dr_data_fifo->w, (unsigned long)p_bt->dr_data_fifo->r);
-        }
+        mask |= POLLIN | POLLRDNORM;
+        goto exit;
     }
 
 exit:
@@ -3701,11 +4000,14 @@ exit:
 
 static long amlbt_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
 {
+    unsigned char coex_running = 0;
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)filp->private_data;
+
     switch (cmd)
     {
         case IOCTL_GET_BT_RECOVERY:
         {
-            if (copy_to_user((unsigned char __user *)arg, &amlbt_dev.recovery_value, sizeof(unsigned char)) != 0)
+            if (copy_to_user((unsigned char __user *)arg, &amlbt_dev.recovery_value, sizeof(unsigned long)) != 0)
             {
                 BTE("IOCTL_GET_BT_RECOVERY copy error\n");
                 return -EFAULT;
@@ -3733,6 +4035,17 @@ static long amlbt_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
             BTI("IOCTL_SET_BT_SHUTDOWN %#x\n", amlbt_dev.shutdown_value);
         }
         break;
+        case IOCTL_GET_COEX_STATUS:
+        {
+            coex_running = ((p_bt->thread_start << 2) | (p_bt->zigbee_start << 1) | p_bt->bt_start);
+            if (copy_to_user((unsigned char __user *)arg, &coex_running, sizeof(unsigned char)) != 0)
+            {
+                BTE("IOCTL_GET_COEX_STATUS copy error\n");
+                return -EFAULT;
+            }
+            BTI("IOCTL_GET_COEX_STATUS %#x\n", coex_running);
+        }
+        break;
     }
     return 0;
 }
@@ -3747,16 +4060,736 @@ static long amlbt_compat_ioctl(struct file* filp, unsigned int cmd, unsigned lon
 }
 #endif
 
+static int amlbt_coex_open(struct inode *inode, struct file *file)
+{
+    BTI("%s \n", __func__);
+    file->private_data = &amlbt_dev;
+    return nonseekable_open(inode, file);
+}
+
+static int amlbt_coex_close(struct inode *inode, struct file *file)
+{
+    BTI("%s \n", __func__);
+
+    return 0;
+}
+
+static int amlbt_zigbee_open(struct inode *inode, struct file *file)
+{
+    int ret = 0;
+    BTI("%s,%d, version:%s\n", __func__, AML_W2LU_VERSION);
+
+    file->private_data = &amlbt_dev;
+
+    ret = amlbt_check_usb();
+    if (ret != 0)
+    {
+        goto err_exit;
+    }
+
+    if (!amlbt_w2lu_coex_is_running(&amlbt_dev))
+    {
+        ret = amlbt_powersave_clear();
+        if (ret != 0)
+        {
+            goto err_exit;
+        }
+
+        if (amlbt_res_init(&amlbt_dev) != 0)
+        {
+            BTI("amlbt_res_init failed!\n");
+            goto err_buf;
+        }
+        //stop bt cpu
+        ret = amlbt_sw_reset();
+        if (ret != 0)
+        {
+            goto err_exit;
+        }
+
+        //amlbt_utils_w2l_usb_init(amlbt_read_word, amlbt_write_word, amlbt_read_sram, amlbt_write_sram);
+        amlbt_load_conf(&amlbt_dev);
+        ret = amlbt_load_firmware(&amlbt_dev);
+        if (ret != 0)
+        {
+            BTI("amlbt_load_firmware failed!\n");
+            goto err_buf;
+        }
+        ret = amlbt_write_word(REG_DEV_RESET, 0, USB_EP2);
+        if (ret != 0)
+        {
+            BTI("start cpu failed!\n");
+            goto err_buf;
+        }
+        ret = amlbt_show_fw_debug_info();
+        if (ret != 0)
+        {
+            BTI("show fw failed!\n");
+            goto err_buf;
+        }
+        amlbt_task_start(&amlbt_dev);
+    }
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+    ret = amlbt_bind_bus();
+    if (ret != 0)
+    {
+        goto err_buf;
+    }
+#endif
+    amlbt_dev.zigbee_start = 1;
+    return nonseekable_open(inode, file);
+err_buf:
+    amlbt_res_deinit(&amlbt_dev);
+err_exit:
+    return nonseekable_open(inode, file);
+}
+
+static int amlbt_zigbee_close(struct inode *inode, struct file *file)
+{
+    int ret = 0;
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file->private_data;
+
+    BTI("%s, version:%s, [%#x,%#x]\n", __func__, AML_W2LU_VERSION, p_bt->bt_start, p_bt->thread_start);
+
+    if (!p_bt->bt_start && !p_bt->thread_start)
+    {
+        amlbt_show_fw_debug_info();
+        p_bt->usb_irq_task_quit = 1;
+        //wait_for_completion(&p_bt->comp);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+        amlbt_unbind_bus();
+#endif
+        //amlbt_utils_w2l_usb_deinit();
+        ret = amlbt_aon_addr_bit_clr(RG_AON_A24, 26);//wake up firmware, make sure firmware running
+        if (ret != 0)
+        {
+            amlbt_res_deinit(&amlbt_dev);
+            return 0;
+        }
+
+        amlbt_res_deinit(&amlbt_dev);
+        amlbt_write_word(RG_AON_A15, 0, USB_EP2); //set bt_en auto mode
+    }
+    p_bt->zigbee_start = 0;
+
+    BTI("zigbee closed\n");
+    return 0;
+}
+
+static ssize_t amlbt_zigbee_write(struct file *file_p,
+                                     const char __user *buf_p,
+                                     size_t count,
+                                     loff_t *pos_p)
+{
+    static unsigned int w_type = 0;
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file_p->private_data;
+    struct sk_buff *skb;
+    //unsigned char *p;
+
+    BTA("%s, count:%ld\n", __func__, count);
+
+    if (count > HCI_MAX_FRAME_SIZE)
+    {
+        BTE("%s:%d count > HCI_MAX_FRAME_SIZE %d, %d!\n", __func__, __LINE__, count, HCI_MAX_FRAME_SIZE);
+        return -EINVAL;
+    }
+
+    if (count == 1) //host write hci type
+    {
+        get_user(w_type, buf_p);
+        return count;
+    }
+
+    if (!p_bt->zigbee_start)
+    {
+        BTE("%s:%d p_bt->zigbee_start == 0!\n", __func__, __LINE__);
+        return -EINVAL;
+    }
+
+    skb = alloc_skb(count+1, GFP_KERNEL);
+    if (!skb)
+    {
+        return -ENOMEM;
+    }
+
+    *(unsigned char *)skb_put(skb, 1) = w_type;
+
+    if (copy_from_user(skb_put(skb, count), buf_p, count))
+    {
+        kfree_skb(skb);
+        BTE("%s: Failed to get data from user space\n", __func__);
+        return -EFAULT;
+    }
+    //p = &skb->data[0];
+    //if (w_type == HCI_15P4_PKT)
+    //{
+    //    BTI("write 15.4 %d, %d:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", skb->len, count,
+    //            p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+    //}
+
+    skb_queue_tail(&p_bt->tx_queue, skb);
+    schedule_work(&p_bt->write_work);
+
+    return count;
+}
+
+
+static ssize_t amlbt_zigbee_read(struct file *file_p,
+                                   char __user *buf_p,
+                                   size_t count,
+                                   loff_t *pos_p)
+{
+    unsigned char zigbee_hw_error[8] = {0x10, 0xfa, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00};
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file_p->private_data;
+    static struct sk_buff *skb;
+
+    if (!p_bt->zigbee_start)
+    {
+        BTE("%s:%d p_bt->zigbee_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    switch (p_bt->zigbee_rd_state)
+    {
+        case HCI_RX_TYPE:   //read type
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+            {
+                BTW("%s:%d BT_DRV_STATE_RECOVERY!\n", __func__, __LINE__);
+                if (copy_to_user(buf_p, &zigbee_hw_error[0], count))
+                {
+                    BTE("%s, copy_to_user error \n", __func__);
+                    return -EFAULT;
+                }
+                p_bt->zigbee_rd_state = HCI_RX_HEADER;
+                return count;
+            }
+
+            skb = skb_dequeue(&p_bt->zigbee_rx_queue);
+            if (!skb)
+            {
+                BTE("zb HCI_RX_TYPE no data!\n");
+                return 0;
+            }
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            p_bt->zigbee_rd_state = HCI_RX_HEADER;
+        break;
+        case HCI_RX_HEADER: // read header
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+            {
+                if (copy_to_user(buf_p, &zigbee_hw_error[1], count))
+                {
+                    BTE("%s, copy_to_user error \n", __func__);
+                    return -EFAULT;
+                }
+                p_bt->zigbee_rd_state = HCI_RX_PAYLOAD;
+                return count;
+            }
+
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            if (skb->len == 0)
+            {
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+            }
+            else
+            {
+                p_bt->zigbee_rd_state = HCI_RX_PAYLOAD;
+            }
+        break;
+        case HCI_RX_PAYLOAD:    //read payload
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+            {
+                if (copy_to_user(buf_p, &zigbee_hw_error[5], count))
+                {
+                    BTE("%s, copy_to_user error \n", __func__);
+                    return -EFAULT;
+                }
+                p_bt->zigbee_rd_state = HCI_RX_FATAL;
+                p_bt->zigbee_start = 0;
+                return count;
+            }
+
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->zigbee_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            kfree_skb(skb);
+            p_bt->zigbee_rd_state = HCI_RX_TYPE;
+            break;
+        default:
+            BTE("%s, evt_state error!!\n", __func__);
+            break;
+    }
+    return count;
+}
+
+static unsigned int amlbt_zigbee_poll(struct file *file, poll_table *wait)
+{
+    int mask = 0;
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file->private_data;
+
+    poll_wait(file, &p_bt->zigbee_wait_queue, wait);
+
+    if (!p_bt->zigbee_start)
+    {
+        mask |= POLLIN | POLLRDNORM;
+        goto exit;
+    }
+
+    if ((p_bt->dr_state & BT_DRV_STATE_RECOVERY) && p_bt->zigbee_rd_state == HCI_RX_FATAL)
+    {
+        goto exit;
+    }
+
+    if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+    {
+        mask |= POLLIN | POLLRDNORM;
+        goto exit;
+    }
+
+    if ((g_udev == NULL) || bus_state_detect.bus_err || bus_state_detect.bus_reset_ongoing)
+    {
+        BTF("%s:%d usb error!, %#x,%#x\n", __func__, __LINE__, bus_state_detect.bus_err, bus_state_detect.bus_reset_ongoing);
+        goto exit;
+    }
+
+    if (p_bt->zigbee_rd_state > HCI_RX_TYPE || skb_queue_len(&p_bt->zigbee_rx_queue) > 0)
+    {
+        mask |= POLLIN | POLLRDNORM;
+        goto exit;
+    }
+
+exit:
+    return mask;
+}
+
+static int amlbt_thread_open(struct inode *inode, struct file *file)
+{
+    int ret = 0;
+    BTI("%s,%d, version:%s\n", __func__, AML_W2LU_VERSION);
+
+    file->private_data = &amlbt_dev;
+
+    ret = amlbt_check_usb();
+    if (ret != 0)
+    {
+        goto err_exit;
+    }
+
+    if (!amlbt_w2lu_coex_is_running(&amlbt_dev))
+    {
+        ret = amlbt_powersave_clear();
+        if (ret != 0)
+        {
+            goto err_exit;
+        }
+
+        if (amlbt_res_init(&amlbt_dev) != 0)
+        {
+            BTI("amlbt_res_init failed!\n");
+            goto err_buf;
+        }
+        //stop bt cpu
+        ret = amlbt_sw_reset();
+        if (ret != 0)
+        {
+            goto err_exit;
+        }
+
+        //amlbt_utils_w2l_usb_init(amlbt_read_word, amlbt_write_word, amlbt_read_sram, amlbt_write_sram);
+        amlbt_load_conf(&amlbt_dev);
+        ret = amlbt_load_firmware(&amlbt_dev);
+        if (ret != 0)
+        {
+            BTI("amlbt_load_firmware failed!\n");
+            goto err_buf;
+        }
+        ret = amlbt_write_word(REG_DEV_RESET, 0, USB_EP2);
+        if (ret != 0)
+        {
+            BTI("start cpu failed!\n");
+            goto err_buf;
+        }
+        ret = amlbt_show_fw_debug_info();
+        if (ret != 0)
+        {
+            BTI("show fw failed!\n");
+            goto err_buf;
+        }
+        amlbt_task_start(&amlbt_dev);
+    }
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+    ret = amlbt_bind_bus();
+    if (ret != 0)
+    {
+        goto err_buf;
+    }
+#endif
+    amlbt_dev.thread_start = 1;
+    return nonseekable_open(inode, file);
+err_buf:
+    amlbt_res_deinit(&amlbt_dev);
+err_exit:
+    return nonseekable_open(inode, file);
+}
+
+static int amlbt_thread_close(struct inode *inode, struct file *file)
+{
+    int ret = 0;
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file->private_data;
+
+    BTI("%s, version:%s\n", __func__, AML_W2LU_VERSION);
+
+    if (!p_bt->bt_start && !p_bt->zigbee_start)
+    {
+        amlbt_show_fw_debug_info();
+        p_bt->usb_irq_task_quit = 1;
+        //wait_for_completion(&p_bt->comp);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+        amlbt_unbind_bus();
+#endif
+        //amlbt_utils_w2l_usb_deinit();
+        ret = amlbt_aon_addr_bit_clr(RG_AON_A24, 26);//wake up firmware, make sure firmware running
+        if (ret != 0)
+        {
+            amlbt_res_deinit(&amlbt_dev);
+            return 0;
+        }
+
+        amlbt_res_deinit(&amlbt_dev);
+        amlbt_write_word(RG_AON_A15, 0, USB_EP2); //set bt_en auto mode
+    }
+    p_bt->thread_start = 0;
+
+    BTI("zigbee closed\n");
+    return 0;
+}
+
+static ssize_t amlbt_thread_write(struct file *file_p,
+                                     const char __user *buf_p,
+                                     size_t count,
+                                     loff_t *pos_p)
+{
+    static unsigned int w_type = 0;
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file_p->private_data;
+    struct sk_buff *skb;
+    //unsigned char *p;
+
+    BTA("%s, count:%ld\n", __func__, count);
+
+    if (count > HCI_MAX_FRAME_SIZE)
+    {
+        BTE("%s:%d count > HCI_MAX_FRAME_SIZE %d, %d!\n", __func__, __LINE__, count, HCI_MAX_FRAME_SIZE);
+        return -EINVAL;
+    }
+
+    if (count == 1) //host write hci type
+    {
+        get_user(w_type, buf_p);
+        return count;
+    }
+
+    if (!p_bt->thread_start)
+    {
+        BTE("%s:%d p_bt->thread_start == 0!\n", __func__, __LINE__);
+        return -EINVAL;
+    }
+
+    skb = alloc_skb(count+1, GFP_KERNEL);
+    if (!skb)
+    {
+        return -ENOMEM;
+    }
+
+    *(unsigned char *)skb_put(skb, 1) = w_type;
+
+    if (copy_from_user(skb_put(skb, count), buf_p, count))
+    {
+        kfree_skb(skb);
+        BTE("%s: Failed to get data from user space\n", __func__);
+        return -EFAULT;
+    }
+    //p = &skb->data[0];
+    //if (w_type == HCI_15P4_PKT)
+    //{
+    //    BTI("write 15.4 %d, %d:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", skb->len, count,
+    //           p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+    //}
+
+    skb_queue_tail(&p_bt->tx_queue, skb);
+    schedule_work(&p_bt->write_work);
+
+    return count;
+}
+
+
+static ssize_t amlbt_thread_read(struct file *file_p,
+                                   char __user *buf_p,
+                                   size_t count,
+                                   loff_t *pos_p)
+{
+    unsigned char thread_hw_error[8] = {0x10, 0xfa, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00};
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file_p->private_data;
+
+    static struct sk_buff *skb;
+
+    if (!p_bt->thread_start)
+    {
+        BTE("%s:%d p_bt->zigbee_start == 0!\n", __func__, __LINE__);
+        return -EFAULT;
+    }
+
+    BTD("rd %#x\n", p_bt->thread_rd_state);
+    switch (p_bt->thread_rd_state)
+    {
+        case HCI_RX_TYPE:   //read type
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+            {
+                BTW("%s:%d BT_DRV_STATE_RECOVERY!\n", __func__, __LINE__);
+                if (copy_to_user(buf_p, &thread_hw_error[0], count))
+                {
+                    BTE("%s, copy_to_user error \n", __func__);
+                    return -EFAULT;
+                }
+                p_bt->thread_rd_state = HCI_RX_HEADER;
+                return count;
+            }
+
+            skb = skb_dequeue(&p_bt->thread_rx_queue);
+            if (!skb)
+            {
+                BTE("zb HCI_RX_TYPE no data!\n");
+                return 0;
+            }
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            p_bt->thread_rd_state = HCI_RX_HEADER;
+        break;
+        case HCI_RX_HEADER: // read header
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+            {
+                if (copy_to_user(buf_p, &thread_hw_error[1], count))
+                {
+                    BTE("%s, copy_to_user error \n", __func__);
+                    return -EFAULT;
+                }
+                p_bt->thread_rd_state = HCI_RX_PAYLOAD;
+                return count;
+            }
+
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            skb_pull(skb, count);
+            if (skb->len == 0)
+            {
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+            }
+            else
+            {
+                p_bt->thread_rd_state = HCI_RX_PAYLOAD;
+            }
+        break;
+        case HCI_RX_PAYLOAD:    //read payload
+            if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+            {
+                if (copy_to_user(buf_p, &thread_hw_error[5], count))
+                {
+                    BTE("%s, copy_to_user error \n", __func__);
+                    return -EFAULT;
+                }
+                p_bt->thread_rd_state = HCI_RX_FATAL;
+                p_bt->thread_start = 0;
+                return count;
+            }
+            if (skb->len < count)
+            {
+                BTE("%s:%d Failed to copy data: %d, %d\n", __func__, __LINE__, skb->len, count);
+                return -EFAULT;
+            }
+            if (copy_to_user(buf_p, skb->data, count))
+            {
+                BTE("%s, copy_to_user error \n", __func__);
+                kfree_skb(skb);
+                p_bt->thread_rd_state = HCI_RX_TYPE;
+                return -EFAULT;
+            }
+            kfree_skb(skb);
+            p_bt->thread_rd_state = HCI_RX_TYPE;
+            break;
+        default:
+            BTE("%s, evt_state error!!\n", __func__);
+            break;
+    }
+    return count;
+}
+
+static unsigned int amlbt_thread_poll(struct file *file, poll_table *wait)
+{
+    int mask = 0;
+    w2l_usb_bt_new_t *p_bt = (w2l_usb_bt_new_t *)file->private_data;
+
+    poll_wait(file, &p_bt->thread_wait_queue, wait);
+
+    if (!p_bt->thread_start)
+    {
+        mask |= POLLIN | POLLRDNORM;
+        goto exit;
+    }
+
+    if ((p_bt->dr_state & BT_DRV_STATE_RECOVERY) && p_bt->thread_rd_state == HCI_RX_FATAL)
+    {
+        goto exit;
+    }
+
+    if (p_bt->dr_state & BT_DRV_STATE_RECOVERY)
+    {
+        mask |= POLLIN | POLLRDNORM;
+        goto exit;
+    }
+
+    if ((g_udev == NULL) || bus_state_detect.bus_err || bus_state_detect.bus_reset_ongoing)
+    {
+        BTF("%s:%d usb error!, %#x,%#x\n", __func__, __LINE__, bus_state_detect.bus_err, bus_state_detect.bus_reset_ongoing);
+        goto exit;
+    }
+    if (p_bt->thread_rd_state > HCI_RX_TYPE || skb_queue_len(&p_bt->thread_rx_queue) > 0)
+    {
+        mask |= POLLIN | POLLRDNORM;
+        goto exit;
+    }
+
+exit:
+    return mask;
+}
+
+static void amlbt_write_work(struct work_struct *work)
+{
+    struct sk_buff *skb;
+    w2l_usb_bt_new_t *p_bt = &amlbt_dev;
+    unsigned char *p;
+    int ret;
+    unsigned int len = 0;
+
+
+    if (amlbt_dev.dr_state != 0)
+    {
+        BTE("amlbt_write_work dr_state:%#x\n", amlbt_dev.dr_state);
+        return ;
+    }
+
+restart:
+    //BTI("amlbt_w2ls_uart_write_work \n");
+
+    while ((skb = skb_dequeue(&p_bt->tx_queue))) {
+        p = skb->data;
+        skb_pull(skb, 1);
+        if (*p == HCI_COMMAND_PKT)
+        {
+            p = skb->data;
+            len = 3 + p[2];
+            //BTI("hci cmd %d, %d:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]", skb->len, len,
+            //    p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+            ret = amlbt_send_hci_cmd(p_bt, skb->data, len);
+        }
+        else if (*p == HCI_ACLDATA_PKT)
+        {
+            p = skb->data;
+            //BTI("hci data %d, %d:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", skb->len, len,
+            //        p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+            ret = amlbt_send_hci_data(p_bt, skb->data, skb->len);
+        }
+        else if (*p == HCI_15P4_PKT)
+        {
+            p = skb->data;
+            //BTI("hci iot %d, %d:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", skb->len, len,
+            //        p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+            ret = amlbt_send_15p4_data(p_bt, skb->data, skb->len);
+        }
+        else
+        {
+            BTE("type error!\n");
+            BTE("raw %d, %d:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]\n", skb->len, len,
+                    p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+        }
+        //BTI("amlbt_w2ls_uart_dequeue skb->len %d \n", skb->len);
+        kfree_skb(skb);
+        //BTI("amlbt_w2ls_uart_write_work complete! \n");
+        if (ret != 0)
+        {
+            BTF("%s:%d Failed : %d\n", __func__, __LINE__, ret);
+        }
+    }
+
+    if (!skb_queue_empty(&p_bt->tx_queue))
+    {
+        goto restart;
+    }
+}
+
+
 int amlbt_w2lu_new_init(void)
 {
     int ret = 0;
-    struct platform_device *p_device = NULL;
-    struct platform_driver *p_driver = NULL;
+    struct platform_device *p_device = &amlbt_device;
+    struct platform_driver *p_driver = &amlbt_driver;
 
     BTI("%s, version:%s", __func__, AML_W2LU_VERSION);
-
-    p_device = &amlbt_device;
-    p_driver = &amlbt_driver;
 
     ret = platform_device_register(p_device);
     if (ret)
@@ -3777,14 +4810,12 @@ int amlbt_w2lu_new_init(void)
 
 void amlbt_w2lu_new_exit(void)
 {
-    struct platform_device *p_device = NULL;
-    struct platform_driver *p_driver = NULL;
+    struct platform_device *p_device = &amlbt_device;
+    struct platform_driver *p_driver = &amlbt_driver;
 
     BTI("%s, log level:%d \n", __func__, g_dbg_level);
 
-    p_device = &amlbt_device;
-    p_driver = &amlbt_driver;
-    platform_driver_unregister(p_driver);
     platform_device_unregister(p_device);
+    platform_driver_unregister(p_driver);
 }
 

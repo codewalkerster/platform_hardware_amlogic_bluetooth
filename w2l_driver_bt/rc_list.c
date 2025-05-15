@@ -66,7 +66,7 @@ static ssize_t rc_list_read(struct device *dev, struct device_attribute *attr, c
     for (i = 0; i < MAX_MAC_LIST; i++) {
         if (rc_list[i].used) {
             mac_to_str(mac_str, rc_list[i].mac);
-            len += sprintf(buf + len, "%s\n", mac_str);
+            len += sprintf(buf + len, "%.18s\n", mac_str);
         }
     }
 

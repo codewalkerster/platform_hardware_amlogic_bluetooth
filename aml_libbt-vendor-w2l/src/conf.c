@@ -73,7 +73,6 @@ unsigned int amlbt_br_digit_gain = 0;
 unsigned int amlbt_edr_digit_gain = 0;
 unsigned int amlbt_fwlog_config = 0;
 unsigned int amlbt_manf_cnt = 0;
-unsigned int amlbt_driver_log = 3;
 unsigned int amlbt_factory = 0;
 unsigned int amlbt_system = 0;
 unsigned char APCF_config_manf_data[256] = {'\0'};
@@ -212,7 +211,6 @@ void load_aml_stack_conf()
 {
     char *str;
     char *split;
-    int len = 0;
     FILE *fp = fopen(AML_VENDOR_LIB_CONF_FILE, "rt");
     if (!fp) {
       ALOGE("%s unable to open file '%s'", __func__,
@@ -291,21 +289,13 @@ void load_aml_stack_conf()
             }
             else
             {
-                len = manf_data_split(str);
+                amlbt_manf_cnt = manf_data_split(str);
             }
-            if (len%6 != 0)
+            if (amlbt_manf_cnt % 6 != 0)
             {
                 amlbt_manf_cnt = 0;
             }
-            else
-            {
-                amlbt_manf_cnt = len/6;
-            }
             ALOGE("%s manf cnt %d", __func__, amlbt_manf_cnt);
-        }
-        else if (!strcmp(aml_trim(line_f), "Btlog")) {
-            amlbt_driver_log = strtol(aml_trim(split+1), &endptr, 0);
-            ALOGE("%s amlbt_driver_log '%#x'", __func__, amlbt_driver_log);
         }
         else if (!strcmp(aml_trim(line_f), "Btfactory")) {
             amlbt_factory = strtol(aml_trim(split+1), &endptr, 0);

@@ -16,13 +16,13 @@ W2L_BT_CFILES := w2l_sdio_bt.c \
 #W2L_BT_CFILES := amlbt.c
 
 $(W2L_BT_MOD_NAME)-objs := $(W2L_BT_CFILES:.c=.o)
+
 ###############################################################################
 # Common
 ###############################################################################
 obj-m += $(W2L_BT_MOD_NAME).o
 
-EXTRA_CFLAGS += -Wno-pointer-to-int-cast -Wno-format
-
+EXTRA_CFLAGS += -Wno-pointer-to-int-cast -Wno-error=format
 
 all:
 	make -C $(KERNEL_SRC) M=$(M) KBUILD_EXTRA_SYMBOLS=$(EXTRA_SYMBOLS_PATH_USB_BT) modules

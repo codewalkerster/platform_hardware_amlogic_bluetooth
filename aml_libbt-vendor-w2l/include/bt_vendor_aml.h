@@ -491,12 +491,13 @@ enum {
 #define TCI_WRITE_REG                           0xfef1
 #define TCI_UPDATE_UART_BAUDRATE                0xfef2
 #define TCI_DOWNLOAD_BT_FW                      0xfef3
+#define AML_BT_CHIP_TYPE         5
+#define AML_BT_INTF_TYPE         3
 
 /*baudrate define FPGA*/
 //#define FPGA_ENABLE
 //#define UART_2M
 #define UART_4M
-
 
 /* h/w config control block */
 typedef struct
@@ -516,33 +517,15 @@ struct aml_coex_msg
 //#define SOCKET_PATH "/vendor/xbin/socket_coex"
 #define SOCKET_PATH "/data/vendor/bluetooth/socket_coex"
 
-#define BTUSB_IOC_MAGIC 'x'
-
-#define IOCTL_GET_BT_RECOVERY           _IOR(BTUSB_IOC_MAGIC, 0, int)
-#define IOCTL_GET_DEVICE_PID            _IOR(BTUSB_IOC_MAGIC, 1, int)
-//debug dev 2-6
-#define IOCTL_SET_BT_SHUTDOWN           _IOW(BTUSB_IOC_MAGIC, 7, int)
-
 /******************************************************************************
 **  Extern variables and functions
 ******************************************************************************/
 
 extern aml_chip_type amlbt_transtype;
-
+extern bt_hw_cfg_cb_t hw_cfg_cb;
 extern bt_vendor_callbacks_t *bt_vendor_cbacks;
 
 extern int hw_set_audio_state(bt_vendor_op_audio_state_t *p_state);
-extern int aml_hci_send_cmd_download(int fd, unsigned char *cmd, int cmdsize, unsigned char *rsp);
-extern void wifi_recovery_to_host();
-extern void hw_reset_close();
-extern void hw_disbt_configure();
-extern void hw_reg_pum_power_cfg_clear();
-extern void hw_shutdown_lescan();
-
 static size_t kverLength = sizeof("XXXX = XX.XX,XXXXXX = XXXXXX") - 1;
-
-void load_aml_stack_conf();
-int do_write(int fd, unsigned char *buf, int len);
-int read_hci_event(int fd, unsigned char *buf, int size);
 
 #endif /* BT_VENDOR_AML_H */

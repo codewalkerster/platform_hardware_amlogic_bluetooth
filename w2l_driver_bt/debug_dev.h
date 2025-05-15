@@ -2,6 +2,7 @@
 #define __DEBUG_DEV_H__
 
 #define AML_BT_CHAR_DEBUG_DEVICE "aml_debug"
+#define AML_BT_CHAR_RECYDBG_NAME "aml_recy_dbg"
 
 #define cmd_len 12
 #define evt_len 16

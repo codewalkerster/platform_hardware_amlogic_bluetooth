@@ -375,16 +375,25 @@ void userial_vendor_ioctl(userial_vendor_ioctl_op_t op, void *p_data __unused)
 #if (BT_WAKE_VIA_USERIAL_IOCTL == TRUE)
         case USERIAL_OP_ASSERT_BT_WAKE:
             VNDUSERIALDBG("## userial_vendor_ioctl: Asserting BT_Wake ##");
-            ioctl(vnd_userial.fd, USERIAL_IOCTL_BT_WAKE_ASSERT, NULL);
+            if (ioctl(vnd_userial.fd, USERIAL_IOCTL_BT_WAKE_ASSERT, NULL) == -1)
+            {
+                ALOGE("Assert BT_WAKE failed: %s", strerror(errno));
+            }
             break;
 
         case USERIAL_OP_DEASSERT_BT_WAKE:
             VNDUSERIALDBG("## userial_vendor_ioctl: De-asserting BT_Wake ##");
-            ioctl(vnd_userial.fd, USERIAL_IOCTL_BT_WAKE_DEASSERT, NULL);
+            if (ioctl(vnd_userial.fd, USERIAL_IOCTL_BT_WAKE_DEASSERT, NULL) == -1)
+            {
+                ALOGE("De-assert BT_WAKE failed: %s", strerror(errno));
+            }
             break;
 
         case USERIAL_OP_GET_BT_WAKE_STATE:
-            ioctl(vnd_userial.fd, USERIAL_IOCTL_BT_WAKE_GET_ST, p_data);
+            if (ioctl(vnd_userial.fd, USERIAL_IOCTL_BT_WAKE_GET_ST, p_data) == -1)
+            {
+                ALOGE("Get BT_WAKE state failed: %s", strerror(errno));
+            }
             break;
 #endif          //  (BT_WAKE_VIA_USERIAL_IOCTL==TRUE)
 

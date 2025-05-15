@@ -78,6 +78,19 @@ typedef unsigned long SYS_TYPE;
 #define TRUE   (!FALSE)
 #endif
 
+struct aml_bus_state_detect {
+    unsigned char bus_err;
+    unsigned char usb_disconnect;
+    unsigned char is_drv_load_finished;
+    unsigned char bus_reset_ongoing;
+    unsigned char is_load_by_timer;
+    unsigned char is_recy_ongoing;
+    struct timer_list timer;
+    struct work_struct detect_work;
+    int (*insmod_drv)(void);
+    unsigned char usb_suspend;
+};
+
 struct tx_trb_info_ex
 {
     /* The number of pages needed for a single transfer */
@@ -319,6 +332,7 @@ typedef int (*rw_inf)(unsigned int addr, unsigned int ep, unsigned int *value);
 #define IOCTL_GET_BT_BUF            _IOR(BTUSB_IOC_MAGIC, 5, int)
 #define IOCTL_GET_BT_VERSION        _IOR(BTUSB_IOC_MAGIC, 6, int)
 #define IOCTL_SET_BT_SHUTDOWN       _IOW(BTUSB_IOC_MAGIC, 7, int)
+#define IOCTL_GET_COEX_STATUS       _IOR(BTUSB_IOC_MAGIC, 8, int)
 
 #define FAMILY_TYPE_IS_W1(x)        ((AMLBT_PD_ID_FAMILY & x) == AMLBT_FAMILY_W1)
 #define FAMILY_TYPE_IS_W1U(x)       ((AMLBT_PD_ID_FAMILY & x) == AMLBT_FAMILY_W1U)
@@ -357,7 +371,7 @@ typedef int (*rw_inf)(unsigned int addr, unsigned int ep, unsigned int *value);
 #define BTP(fmt, arg...) if (g_dbg_level >= LOG_LEVEL_POINT) printk(KERN_INFO "BTP:" fmt, ## arg)
 #define BTW(fmt, arg...) if (g_dbg_level >= LOG_LEVEL_WARN) printk(KERN_ERR "BTW:" fmt, ## arg)
 #define BTE(fmt, arg...) if (g_dbg_level >= LOG_LEVEL_ERROR) printk(KERN_ERR "BTE:" fmt, ## arg)
-#define BTF(fmt, arg...) if (g_dbg_level >= LOG_LEVEL_FATAL) printk(KERN_ERR "BTF:" fmt, ## arg)
+#define BTF(fmt, arg...) /*if (g_dbg_level >= LOG_LEVEL_FATAL)*/ printk(KERN_ERR "BTF:" fmt, ## arg)
 
 
 //input device

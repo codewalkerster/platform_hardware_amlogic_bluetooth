@@ -58,6 +58,9 @@
 #define DBG_CMD_LEN              (4096)
 #define DBG_CMD_R                DBG_USB_MEM_ADDR
 #define DBG_CMD_W                DBG_USB_MEM_ADDR + 0x04
+//recovery dbg use
+#define MAX_DBG_BUF              64
+#define BT_DRV_STATE_RECOVERY    BIT(3)
 
 static ws_inf p_ws_inf = NULL;
 static rs_inf p_rs_inf = NULL;
@@ -92,6 +95,10 @@ typedef struct
 } debug_dev_t;
 
 static debug_dev_t debug_dev = {0};
+
+static char recy_dbg_buf[MAX_DBG_BUF] = {0};
+static ssize_t recy_dbg_read(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t recy_dbg_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
 
 static unsigned int dbg_write_data_by_ep(gdsl_fifo_t *p_fifo, unsigned char *data, unsigned int len, unsigned int ep)
 {
@@ -165,6 +172,10 @@ int amlbt_debug_filter_event(unsigned char *evt_buf)
         return 1;
     }
     if (evt_buf[1] == 0x13 && evt_buf[3] == 0x1)   //number of complete
+    {
+        return 1;
+    }
+    if (evt_buf[1] == 0x05 && evt_buf[3] == 0x00) //disconnect complete
     {
         return 1;
     }
@@ -382,30 +393,51 @@ void amlbt_debug_get_event(unsigned int w, unsigned int r, unsigned char *data)
 void amlbt_show_debug(void)
 {
     int i = 1;
+    unsigned int r = 0;
+    unsigned int w = 0;
+    unsigned int opcode = 0;
+    unsigned int playload = 0;
+    unsigned char *p = debug_dev._cmd.dbg_cmd_inf;
+    unsigned int line = sizeof(debug_dev._cmd.dbg_cmd_inf)/cmd_len;
 
     printk(KERN_CONT "cmd debug:[\n");
-    for (; i <= sizeof(debug_dev._cmd.dbg_cmd_inf); i++)
+    for (; i <= line; i++)
     {
-        printk(KERN_CONT "%#x ", debug_dev._cmd.dbg_cmd_inf[i-1]);
-        if (i % cmd_len == 0)
+        w = (unsigned int)((p[3]<<24)|(p[2]<<16)|(p[1]<<8)|p[0]);
+        r = (unsigned int)((p[7]<<24)|(p[6]<<16)|(p[5]<<8)|p[4]);
+        opcode = (unsigned int)((p[9]<<8)|p[8]);
+        if (i == debug_dev._cmd.cmd_index)
         {
-            printk(KERN_INFO "");
+            printk(KERN_CONT "W:%#x R:%#x op_end:%#x \n", w, r, opcode);
         }
+        else
+        {
+            printk(KERN_CONT "W:%#x R:%#x op:%#x \n", w, r, opcode);
+        }
+        p += cmd_len;
     }
     printk(KERN_CONT "]\n");
-    BTI("cmd_index %d \n", debug_dev._cmd.cmd_index);
+    BTI("cmd_index %d \n", (debug_dev._cmd.cmd_index-1));
 
+    p = debug_dev._cmd.dbg_evt_inf;
     printk(KERN_CONT "event debug:[ \n");
-    for (i = 1; i <= sizeof(debug_dev._cmd.dbg_evt_inf); i++)
+    for (i = 1; i <= line; i++)
     {
-        printk(KERN_CONT "%#x ", debug_dev._cmd.dbg_evt_inf[i-1]);
-        if (i % evt_len == 0)
+        w = (unsigned int)((p[3]<<24)|(p[2]<<16)|(p[1]<<8)|p[0]);
+        r = (unsigned int)((p[7]<<24)|(p[6]<<16)|(p[5]<<8)|p[4]);
+        playload = (unsigned int)((p[13]<<8)|p[12]);
+        if (i == debug_dev._cmd.evt_index)
         {
-            printk(KERN_INFO "");
+            printk(KERN_CONT "W:%#x R:%#x evt_end:%#x \n", w, r, playload);
         }
+        else
+        {
+            printk(KERN_CONT "W:%#x R:%#x evt:%#x \n", w, r, playload);
+        }
+        p += evt_len;
     }
     printk(KERN_CONT "]\n");
-    BTI("evt_index %d \n", debug_dev._cmd.evt_index);
+    BTI("evt_index %d \n", (debug_dev._cmd.evt_index-1));
 }
 
 static long amlbt_debug_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
@@ -505,6 +537,51 @@ static long amlbt_debug_ioctl(struct file* filp, unsigned int cmd, unsigned long
     return 0;
 }
 
+static struct device_attribute recy_attr_dbg = {
+    .attr = { .name = AML_BT_CHAR_RECYDBG_NAME, .mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH },
+    .show = recy_dbg_read,
+    .store = recy_dbg_write,
+};
+
+static ssize_t recy_dbg_read(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "%s\n", recy_dbg_buf);
+}
+
+static ssize_t recy_dbg_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    BTI("recy_dbg_write count: %zu\n", count);
+
+    if (count > sizeof(recy_dbg_buf) - 1)
+    {
+        count = sizeof(recy_dbg_buf) - 1;
+    }
+    memset(recy_dbg_buf, 0, sizeof(recy_dbg_buf));
+    memcpy(recy_dbg_buf, buf, count);
+    recy_dbg_buf[count] = '\0';
+
+    if (strncmp(buf, "over", 4) == 0 || strncmp(buf, "over\n", 5) == 0)
+    {
+        BTI("%s bt recovery!\n", __func__);
+        debug_dev.w2l_dev->dr_state = BT_DRV_STATE_RECOVERY;
+        debug_dev.w2l_dev->recovery_value = BT_DRV_STATE_RECOVERY;
+    }
+
+    return count;
+}
+
+static int amlbt_recy_dbg_init(void)
+{
+    int res = 0;
+
+    res = device_create_file(debug_dev.w2l_dev->dev_device[0], &recy_attr_dbg);
+    if (res)
+    {
+        BTE("%s:Failed to create device attribute\n", __func__);
+    }
+    return res;
+}
+
 static ssize_t amlbt_debug_level_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     char temp[10];
@@ -515,7 +592,7 @@ static ssize_t amlbt_debug_level_read(struct file *file, char __user *buf, size_
 static ssize_t amlbt_debug_level_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
     char temp[10];
-    int ret, val;
+    int ret = 0, val = 0;
 
     if (count > sizeof(temp) - 1)
         return -EINVAL;
@@ -590,7 +667,7 @@ static const struct file_operations amlbt_debug_fops =
 static int amlbt_create_debug_device(debug_dev_t *d_bt)
 {
     int ret = 0;
-    dev_t dev;
+    dev_t dev = 0;
 
     ret = alloc_chrdev_region(&dev, 0, 1,  AML_BT_CHAR_DEBUG_DEVICE);
     if (ret)
@@ -701,17 +778,18 @@ int amlbt_debug_dev_init(ws_inf p_ws_func, rs_inf p_rs_func, ww_inf p_ww_func, r
     {
         BTE("%s:Failed to create debugfs_create_dir\n", __func__);
     }
+    res = amlbt_recy_dbg_init();
+    if (res)
+    {
+        BTE("%s:Failed to create recy debug device attribute\n", __func__);
+    }
     return res;
-}
-
-static void amlbt_debug_buff_deinit(void)
-{
-    debug_dev.w2l_dev = NULL;
 }
 
 void amlbt_debug_dev_deinit(void)
 {
-    amlbt_debug_buff_deinit();
+    device_remove_file(debug_dev.w2l_dev->dev_device[0], &recy_attr_dbg);
+    debug_dev.w2l_dev = NULL;
     amlbt_debug_level_deinit();
     amlbt_destroy_debug_device(&debug_dev);
 }
