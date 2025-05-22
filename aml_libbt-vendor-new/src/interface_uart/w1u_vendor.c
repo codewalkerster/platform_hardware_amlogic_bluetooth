@@ -92,7 +92,7 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
         property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
         if (strstr(shutdwon_status, "0userrequested") == NULL)
         {
-            rmmod("aml_bt", 60);
+            rmmod("w1u_bt", 60);
             rmmod("w1u_comm", 60);
             upio_set_bluetooth_power(UPIO_BT_POWER_OFF);
         }
@@ -112,7 +112,7 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
         ALOGD("%s %s", __FUNCTION__, driver_pram);
         //insmod driver
         insmod("/vendor/lib/modules/w1u_comm.ko", "bus_type=sdio", "w1u_comm", 200);
-        insmod("/vendor/lib/modules/aml_bt.ko", driver_pram, "aml_bt", 200);
+        insmod("/vendor/lib/modules/w1u_bt.ko", driver_pram, "w1u_bt", 200);
     }
     ALOGD("%s %d \n", __func__, state);
     return 0;
@@ -148,12 +148,14 @@ static int libbt_op_userial_open(int state, int (*fd_array)[])
         {
             return -1;
         }
+/*
         bt_sdio_fd = userial_vendor_devchar_open();
         if (bt_sdio_fd < 0)
         {
             ALOGD("bluetooth node open failed!");
             return -1;
         }
+*/
     }
     else
     {
@@ -169,6 +171,10 @@ static int libbt_op_userial_close(int state, int (*fd_array)[])
 {
     property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
     ALOGD("%s %s ", __FUNCTION__, shutdwon_status);
+    if (hw_cfg_cb.state == 0)
+    {
+        aml_reset_bt(g_userial_fd);
+    }
     userial_vendor_close();
 
     return 0;

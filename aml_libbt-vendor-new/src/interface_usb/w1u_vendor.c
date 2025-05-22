@@ -83,7 +83,7 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
                 *((unsigned short*)&amlbt_transtype));
         ALOGD("%s %s", __FUNCTION__, driver_pram);
         insmod("/vendor/lib/modules/w1u_comm.ko", "bus_type=usb", "w1u_comm", 200);
-        insmod("/vendor/lib/modules/aml_bt.ko", driver_pram, "aml_bt", 200);
+        insmod("/vendor/lib/modules/w1u_bt.ko", driver_pram, "w1u_bt", 200);
     }
     ALOGD("%s state %d\n", __func__, state);
     return 0;
@@ -127,6 +127,10 @@ static int libbt_op_userial_close(int state, int (*fd_array)[])
 {
     property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
     ALOGD("%s %s ", __FUNCTION__, shutdwon_status);
+    if (hw_cfg_cb.state == 0)
+    {
+        aml_reset_bt(g_userial_fd);
+    }
     userial_vendor_close();
 
     return 0;

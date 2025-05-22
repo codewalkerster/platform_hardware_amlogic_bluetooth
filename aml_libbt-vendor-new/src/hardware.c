@@ -1073,6 +1073,15 @@ uint8_t hw_cfg_download_firmware_dccm_uart(void *p_mem, HC_BT_HDR *p_buf, uint8_
         ALOGI("dccm write over successfully. ");
         hw_cfg_cb.state = HW_CFG_AML_DOWNLOAD_FIRMWARE_CLOSE_EVENT;
         cnt = 0;
+        if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
+      {
+        bt_sdio_fd = userial_vendor_devchar_open();
+        if (bt_sdio_fd < 0)
+        {
+          ALOGD("bluetooth node open failed!");
+          return -1;
+        }
+      }
     }
 
     return is_proceeding;

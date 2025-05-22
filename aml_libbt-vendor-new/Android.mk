@@ -56,7 +56,7 @@ LOCAL_CFLAGS += -DO_AMLOGIC
 endif
 
 ifeq ($(BOARD_HAVE_BLUETOOTH_MULTIBT),true)
-	LOCAL_MODULE := libbt-vendor_aml_w2l
+	LOCAL_MODULE := libbt-vendor_aml_new
 else
 	LOCAL_MODULE := libbt-vendor
 endif
