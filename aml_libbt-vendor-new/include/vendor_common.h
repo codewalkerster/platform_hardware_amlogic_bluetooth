@@ -26,6 +26,9 @@
 //debug dev 2-6
 #define IOCTL_SET_BT_SHUTDOWN                   _IOW(BTUSB_IOC_MAGIC, 7, int)
 #define IOCTL_GET_COEX_STATUS                   _IOR(BTUSB_IOC_MAGIC, 8, int)
+#define IOCTL_REGISTER_SDIO                     _IOW(BTUSB_IOC_MAGIC, 9, int)
+
+#define W1U_ROM_START_CODE                      0x0cc0006f
 
 //vendor cmd
 #define HCI_READ_LOCAL_INFO                     0x1001
@@ -93,6 +96,7 @@
 //coxe bit
 #define ZIGBEE_ALIVE            (1 << 1)
 #define THREAD_ALIVE            (1 << 2)
+#define BIT(_n)                 (1 << (_n))
 
 typedef int (*libbt_func_t)(int state, int (*fd_array)[]);
 
@@ -130,6 +134,10 @@ extern void vnd_load_conf(const char *p_path);
 extern uint32_t hw_lpm_get_idle_timeout(void);
 extern uint8_t hw_lpm_enable(uint8_t turn_on);
 extern void hw_lpm_set_wake_state(uint8_t wake_assert);
+
+unsigned int amlbt_get_reg(unsigned int addr);
+void save_regs_to_file(unsigned char *buf, size_t len, const char *filepath);
+void save_regs_with_time_str(unsigned char *buf, size_t len, const char *filepath);
 
 //common interface
 int driver_check(const char *modname, int timeout_ms);

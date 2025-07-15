@@ -1,3 +1,11 @@
+/*
+* Copyright (c) 202X Amlogic, Inc. All rights reserved.
+*
+* This source code is subject to the terms and conditions defined in the
+* file 'LICENSE' which is part of this source code package.
+*
+* Description:
+*/
 #ifndef __COMMON_H__
 #define __COMMON_H__
 
@@ -308,6 +316,8 @@ typedef int (*ws_inf)(unsigned char *buf, unsigned char *sram_addr, unsigned int
 typedef int (*rs_inf)(unsigned char *buf, unsigned char *sram_addr, unsigned int len, unsigned int ep);
 typedef int (*ww_inf)(unsigned int addr,unsigned int data, unsigned int ep);
 typedef int (*rw_inf)(unsigned int addr, unsigned int ep, unsigned int *value);
+typedef void (*sdio_ww_inf)(unsigned int addr,unsigned int data);
+typedef unsigned int (*sdio_rw_inf)(unsigned int addr);
 
 #define BTUSB_IOC_MAGIC 'x'
 

@@ -1,3 +1,11 @@
+/*
+* Copyright (c) 202X Amlogic, Inc. All rights reserved.
+*
+* This source code is subject to the terms and conditions defined in the
+* file 'LICENSE' which is part of this source code package.
+*
+* Description:
+*/
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -30,6 +38,7 @@
 #include "amlbt.h"
 #include "w1u_usb_bt_new.h"
 #include "debug_dev.h"
+#include "rc_list.h"
 
 #define W1u_VENDOR  0x414D
 
@@ -349,8 +358,6 @@ static int amlbt_close(struct inode *inode, struct file *file);
 static int amlbt_submit_poll_urb(w1u_usb_bt_new_t *p_bt);
 static void amlbt_lateresume(struct early_suspend *h);
 static void amlbt_earlysuspend(struct early_suspend *h);
-static void amlbt_register_wakeupsource(w1u_usb_bt_new_t *p_bt);
-static void amlbt_unregister_wakeupsource(w1u_usb_bt_new_t *p_bt);
 static int amlbt_download_firmware(w1u_usb_bt_new_t *p_bt);
 static int amlbt_task_start(w1u_usb_bt_new_t *p_bt);
 static ssize_t amlbt_write(struct file *file_p, const char __user *buf_p, size_t count, loff_t *pos_p);
@@ -453,58 +460,6 @@ static void get_btwakeup_work(unsigned int key)
         default:
             BTF("No identification key\n");
         break;
-    }
-}
-
-static void amlbt_wakeup_mutex(unsigned int flag)
-{
-    w1u_usb_bt_new_t *p_bt = &amlbt_dev;
-
-    BTI("%s\n", __func__);
-    if (flag)
-    {
-        // Wake up the system and prevent it from entering
-        if (p_bt->amlbt_wakeup_source && (!p_bt->amlbt_wakeup_source->active))
-        {
-            __pm_stay_awake(p_bt->amlbt_wakeup_source);
-        }
-        else
-        {
-            BTF("amlbt_wakeup_source is not initialized or active already\n");
-        }
-    }
-    else
-    {
-        if (p_bt->amlbt_wakeup_source && p_bt->amlbt_wakeup_source->active)
-        {
-            __pm_relax(p_bt->amlbt_wakeup_source);
-        }
-        else
-        {
-            BTF("amlbt_wakeup_source is not initialized or not active\n");
-        }
-    }
-    p_bt->wake_mux = flag;
-    BTI("system state updated: %d\n", flag);
-}
-
-static void amlbt_wakeup_lock(void)
-{
-    w1u_usb_bt_new_t *p_bt = &amlbt_dev;
-
-    if (!p_bt->wake_mux)
-    {
-        amlbt_wakeup_mutex(1);
-    }
-}
-
-static void amlbt_wakeup_unlock(void)
-{
-    w1u_usb_bt_new_t *p_bt = &amlbt_dev;
-
-    if (p_bt->wake_mux)
-    {
-        amlbt_wakeup_mutex(0);
     }
 }
 
@@ -1047,6 +1002,7 @@ static int amlbt_resume_fw(void)
     if ((enum usb_udev_state)g_udev->state == USB_CONFIGURED)
     {
         ret = 0;
+        amlbt_clear_rclist_from_firmware();
     }
 #if 0
     int wait_cnt = 0;
@@ -1095,11 +1051,11 @@ static int amlbt_suspend_fw(w1u_usb_bt_new_t *p_bt)
     int ret = 0;
 
     BTI("%s\n", __func__);
-    /*ret = amlbt_write_rclist_to_firmware();
+    ret = amlbt_write_rclist_to_firmware();
     if (ret != 0)
     {
         goto err_exit;
-    }*/
+    }
     //set suspend bit
     ret = amlbt_aon_addr_bit_set(RG_AON_A52, 26);
     if (ret != 0)
@@ -1121,6 +1077,7 @@ static int amlbt_suspend_fw(w1u_usb_bt_new_t *p_bt)
 static void amlbt_shutdown_func(void)
 {
     BTI("%s\n", __func__);
+    amlbt_write_rclist_to_firmware();
     amlbt_aon_addr_bit_set(RG_AON_A52, 27);
 }
 
@@ -1296,6 +1253,7 @@ static int amlbt_res_init(w1u_usb_bt_new_t *p_bt)
     p_bt->rd_state = 0;
     p_bt->sink_mode = 0;
     p_bt->input_key = 0;
+    p_bt->system = 0;
 
     amlbt_read_word(DRIVER_FW_STATUS, USB_EP1, &st_reg);
     st_reg |= SRAM_FD_INIT_FLAG;
@@ -1534,35 +1492,6 @@ static void amlbt_unregister_early_suspend(struct platform_device *dev)
     unregister_early_suspend(&amlbt_dev.early_suspend);
 }
 
-static void amlbt_register_wakeupsource(w1u_usb_bt_new_t *p_bt)
-{
-    BTI("%s\n", __func__);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
-    amlbt_dev.amlbt_wakeup_source = wakeup_source_register("amlbt_wakeup_source");
-#else
-    amlbt_dev.amlbt_wakeup_source = wakeup_source_register(NULL, "amlbt_wakeup_source");
-#endif
-    if (!amlbt_dev.amlbt_wakeup_source)
-    {
-        BTE("Failed to create wakeup source\n");
-        return ;
-    }
-}
-
-static void amlbt_unregister_wakeupsource(w1u_usb_bt_new_t *p_bt)
-{
-    BTI("%s\n", __func__);
-    if (p_bt->amlbt_wakeup_source)
-    {
-        wakeup_source_unregister(p_bt->amlbt_wakeup_source);
-        p_bt->amlbt_wakeup_source = NULL;
-    }
-    else
-    {
-        BTE("amlbt_wakeup_source is not initialized, unregistering is not required.\n");
-    }
-}
-
 static int amlbt_input_device_init(struct platform_device *pdev)
 {
     int err;
@@ -1607,9 +1536,8 @@ static int amlbt_probe(struct platform_device *dev)
     g_bt_shutdown_func = amlbt_shutdown_func;
     amlbt_create_device(&amlbt_dev);
     //amlbt_debug_dev_init(amlbt_write_sram, amlbt_read_sram, amlbt_write_word, amlbt_read_word, &amlbt_dev);
-    //amlbt_rc_list_init(amlbt_dev.dev_device, amlbt_write_sram, amlbt_read_sram);
+    amlbt_rc_list_init(amlbt_dev.dev_device, amlbt_write_sram, amlbt_read_sram, NULL, NULL);
     amlbt_register_early_suspend(dev);
-    amlbt_register_wakeupsource(&amlbt_dev);
     amlbt_cmd_buf_init();
         //input devices
     amlbt_input_device_init(dev);
@@ -1631,9 +1559,9 @@ static void amlbt_remove(struct platform_device *dev)
         amlbt_dev.amlbt_input_dev = NULL;
     }
     //amlbt_debug_dev_deinit();
-    amlbt_unregister_wakeupsource(&amlbt_dev);
+
     amlbt_unregister_early_suspend(dev);
-    //amlbt_rc_list_deinit(amlbt_dev.dev_device);
+    amlbt_rc_list_deinit(amlbt_dev.dev_device);
     amlbt_destroy_device(&amlbt_dev);
     amlbt_res_deinit(&amlbt_dev);//no need to clear wake_mux
     amlbt_cmd_buf_deinit();
@@ -1704,7 +1632,7 @@ static int amlbt_resume(struct platform_device *dev)
 static void amlbt_shutdown(struct platform_device *dev)
 {
     BTI("%s \n", __func__);
-    amlbt_write_word(RG_BT_PMU_A16, 0, USB_EP1);
+    //amlbt_write_word(RG_BT_PMU_A16, 0, USB_EP1);
 }
 
 static void amlbt_earlysuspend(struct early_suspend *h)
@@ -1882,7 +1810,10 @@ static int amlbt_load_conf(w1u_usb_bt_new_t *p_bt)
             BTI("Parsed Btlog: %d\n", p_bt->driver_log);
         } else if (parse_int_value(line_start, "Btfactory", &p_bt->factory)) {
             BTI("Parsed Btfactory: %d\n", p_bt->factory);
-        }/* else {
+        } else if (parse_int_value(line_start, "Btsystem", &p_bt->system)) {
+            BTI("Parsed Btsystem: %d\n", p_bt->system);
+        }
+        /* else {
             BTI("unknown key in configuration file: %s\n", line_start);
         }*/
 
@@ -1936,12 +1867,18 @@ static int amlbt_load_firmware(w1u_usb_bt_new_t *p_bt)
         return ret;
     }
     amlbt_read_word(REG_PMU_POWER_CFG, USB_EP1, &reg);
+    reg &= 0xedffffff;
     reg |= ((p_bt->antenna << BIT_RF_NUM)|(p_bt->bt_sink << BT_SINK_MODE));
     amlbt_write_word(REG_PMU_POWER_CFG, reg, USB_EP1);
 
+    amlbt_read_word(RG_AON_A53, USB_EP1, &reg);
+    reg &= 0xff7fffff;
+    reg |= (p_bt->system << 23);
+    amlbt_write_word(RG_AON_A53, reg, USB_EP1);
+
     p_bt->iccm_buf = NULL;
     p_bt->dccm_buf = NULL;
-    amlbt_wakeup_unlock();
+
     return 0;
 }
 
@@ -3019,13 +2956,13 @@ static unsigned int amlbt_poll(struct file *file, poll_table *wait)
     int mask = 0;
     w1u_usb_bt_new_t *p_bt = (w1u_usb_bt_new_t *)file->private_data;
 
-    poll_wait(file, &p_bt->rd_wait_queue, wait);
-
     if (!p_bt->firmware_start)
     {
         mask |= POLLIN | POLLRDNORM;
         goto exit;
     }
+
+    poll_wait(file, &p_bt->rd_wait_queue, wait);
 
     if ((p_bt->dr_state & BT_DRV_STATE_RECOVERY) && p_bt->rd_state == HCI_RX_FATAL)
     {

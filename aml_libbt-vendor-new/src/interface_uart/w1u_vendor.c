@@ -60,6 +60,8 @@
 #include "userial_vendor.h"
 #include "vendor_common.h"
 
+static unsigned long bt_shutdown = 1;
+
 static const tUSERIAL_CFG userial_init_cfg =
 {
     (USERIAL_DATABITS_8 | USERIAL_PARITY_NONE | USERIAL_STOPBITS_1),
@@ -92,13 +94,21 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
         property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
         if (strstr(shutdwon_status, "0userrequested") == NULL)
         {
-            rmmod("w1u_bt", 60);
-            rmmod("w1u_comm", 60);
+            //rmmod("w1u_bt", 60);
+            //rmmod("w1u_comm", 60);
             upio_set_bluetooth_power(UPIO_BT_POWER_OFF);
         }
     }
     else if (state == BT_VND_PWR_ON)
     {
+        snprintf(driver_pram, sizeof(driver_pram), "amlbt_if_type=%u",
+                *((unsigned short*)&amlbt_transtype));
+        ALOGD("%s %s", __FUNCTION__, driver_pram);
+
+        rmmod("wifi_comm", 100);
+        //insmod driver
+        insmod("/vendor/lib/modules/w1u_comm.ko", "bus_type=sdio", "w1u_comm", 200);
+        insmod("/vendor/lib/modules/w1u_bt.ko", driver_pram, "w1u_bt", 200);
         // bt en on
         if (upio_power_get() == 0)
         {
@@ -106,13 +116,6 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
             upio_set_bluetooth_power(UPIO_BT_POWER_ON);
             ALOGD("end, set bt power");
         }
-        rmmod("wifi_comm", 100);
-        snprintf(driver_pram, sizeof(driver_pram), "amlbt_if_type=%u",
-                *((unsigned short*)&amlbt_transtype));
-        ALOGD("%s %s", __FUNCTION__, driver_pram);
-        //insmod driver
-        insmod("/vendor/lib/modules/w1u_comm.ko", "bus_type=sdio", "w1u_comm", 200);
-        insmod("/vendor/lib/modules/w1u_bt.ko", driver_pram, "w1u_bt", 200);
     }
     ALOGD("%s %d \n", __func__, state);
     return 0;
@@ -189,6 +192,22 @@ static int libbt_op_get_lpm_idle_timeout(int state, int (*fd_array)[])
 static int libbt_op_lpm_set_mode(int state, int (*fd_array)[])
 {
     ALOGD("%s \n", __func__);
+    if (state == BT_VND_PWR_OFF)
+    {
+        property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
+        if (strstr(shutdwon_status, "0userrequested") != NULL)
+        {
+            if (ioctl(bt_sdio_fd, IOCTL_SET_BT_SHUTDOWN, &bt_shutdown) != 0)
+            {
+                ALOGD("ioctl send failed: fd %d, error %s", bt_sdio_fd, strerror(errno));
+            }
+            else
+            {
+                ALOGD("send bt shutdown=%ld\n", bt_shutdown);
+            }
+        }
+        ALOGD("%s \n", __func__);
+    }
     return 0;
 }
 

@@ -486,13 +486,15 @@ enum {
 #define DCCM_RAM_BASE           (0xd00000)
 #define WIFI_RAM_BASE           (0x212800)  //15KB
 
-#define RW_OPERATION_SIZE        (248)
+#define RW_OPERATION_SIZE                       (248)
 #define TCI_READ_REG                            0xfef0
 #define TCI_WRITE_REG                           0xfef1
 #define TCI_UPDATE_UART_BAUDRATE                0xfef2
 #define TCI_DOWNLOAD_BT_FW                      0xfef3
-#define AML_BT_CHIP_TYPE         5
-#define AML_BT_INTF_TYPE         3
+#define AML_BT_CHIP_TYPE                        5
+#define AML_BT_INTF_TYPE                        3
+#define MANF_ROW                                16
+#define MANF_COLUMN                             16
 
 /*baudrate define FPGA*/
 //#define FPGA_ENABLE

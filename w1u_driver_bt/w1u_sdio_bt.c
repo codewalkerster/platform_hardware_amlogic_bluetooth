@@ -1,3 +1,11 @@
+/*
+* Copyright (c) 202X Amlogic, Inc. All rights reserved.
+*
+* This source code is subject to the terms and conditions defined in the
+* file 'LICENSE' which is part of this source code package.
+*
+* Description:
+*/
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -42,6 +50,7 @@
 #include "common.h"
 #include "amlbt.h"
 #include "w1u_sdio_bt.h"
+#include "rc_list.h"
 
 #define AML_BT_NOTE "stpbt"
 #define ICCM_SIZE   0x10000
@@ -57,7 +66,7 @@
 
 #define AML_BT_CONFIG_NAME   "aml_bt.conf"
 #define AML_BT_FIRMWARE_NAME "w1u_bt_fw_uart.bin"
-//#define W1U_FW_PATCH
+#define W1U_ROM_START_CODE      0x0cc0006f
 
 #ifndef BIT
 #define BIT(_n)  (1 << (_n))
@@ -120,12 +129,13 @@
 #define PMU_WAKE_WAIT     0xa
 #define PMU_WAKE_XOSC     0xb
 
+extern void aml_sdio_exit(void);
+extern int  aml_sdio_init(void);
 extern struct aml_hif_sdio_ops g_hif_sdio_ops;
 extern struct aml_pm_type g_wifi_pm;
-//extern struct sdio_func *aml_priv_to_func(int func_n);
-typedef void (*bt_pm_func)(void);
-extern bt_pm_func g_bt_suspend_func;
-extern bt_pm_func g_bt_resume_func;
+extern struct sdio_func *aml_priv_to_func(int func_n);
+extern unsigned char g_sdio_driver_insmoded;
+extern unsigned char g_sdio_wifi_bt_alive;
 
 //extern unsigned char aml_wifi_detect_bt_status __attribute__((weak));
 
@@ -152,8 +162,10 @@ static ssize_t amlbt_sdio_char_read(struct file *file_p,
                                    size_t count,
                                    loff_t *pos_p);
 static void amlbt_wake_func(struct work_struct *work);
-static void amlbt_suspend_func(void);
-static void amlbt_resume_func(void);
+static long amlbt_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
+#ifdef CONFIG_COMPAT
+static long amlbt_compat_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
+#endif
 
 static void amlbt_dev_release(struct device *dev)
 {
@@ -189,9 +201,9 @@ static const struct file_operations amlbt_sdio_fops =
     .release    = amlbt_sdio_fops_close,
     .write      = amlbt_sdio_char_write,
     .read      = amlbt_sdio_char_read,
-    .unlocked_ioctl = NULL,
+    .unlocked_ioctl = amlbt_ioctl,
 #ifdef CONFIG_COMPAT
-    .compat_ioctl = NULL,
+    .compat_ioctl = amlbt_compat_ioctl,
 #endif
     .poll       = NULL,
     .fasync     = NULL
@@ -314,17 +326,14 @@ static void amlbt_sdio_res_deinit(w1u_sdio_bt_t *p_sdio)
 {
     BTI("%s \n", __func__);
     p_sdio->irq_handle = 0;
-    g_bt_suspend_func = NULL;
-    g_bt_resume_func = NULL;
 }
 
 static int amlbt_sdio_res_init(w1u_sdio_bt_t *p_sdio)
 {
     BTI("%s \n", __func__);
     p_sdio->irq_handle = 0;
-
-    g_bt_suspend_func = amlbt_suspend_func;
-    g_bt_resume_func = amlbt_resume_func;
+    p_sdio->system = 0;
+    p_sdio->shutdown_value = 0;
 
     return 0;
 }
@@ -350,6 +359,77 @@ static unsigned int amlbt_sdio_read_word(unsigned int addr)
     value = g_hif_sdio_ops.bt_hi_read_word(addr);
     return value;
 }
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+static int amlbt_bind_bus(void)
+{
+    w1u_sdio_bt_t *p_sdio = &sdio_bt;
+
+    if (aml_priv_to_func(7) == NULL)
+    {
+        BTE("aml_priv_to_func(7) is NULL");
+        return -ENOMEM;
+    }
+    else
+    {
+        if (p_sdio->link == NULL)
+        {
+            p_sdio->link = device_link_add(&amlbt_sdio_device.dev, &aml_priv_to_func(7)->dev, DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
+            if (p_sdio->link == NULL)
+            {
+                BTE("Failed to create device link");
+                return -ENOMEM;
+            }
+            else
+            {
+                BTI("Success to create device link");
+            }
+        }
+        else
+        {
+            BTI("p_sdio->link is ready %#x \n", p_sdio->link);
+        }
+    }
+    return 0;
+}
+
+static struct device_link *find_device_link(struct device *consumer, struct device *supplier)
+{
+    struct device_link *link;
+
+    list_for_each_entry(link, &consumer->links.suppliers, c_node)
+    {
+        if (link->supplier == supplier)
+        {
+            return link;
+        }
+    }
+
+    return NULL;
+}
+
+static void amlbt_unbind_bus(void)
+{
+    struct device_link *link = NULL;
+
+    w1u_sdio_bt_t *p_sdio = &sdio_bt;
+
+    if (p_sdio->link != NULL)
+    {
+        if (aml_priv_to_func(7) && device_is_registered(&aml_priv_to_func(7)->dev))
+        {
+            link = find_device_link(&amlbt_sdio_device.dev, &aml_priv_to_func(7)->dev);
+            BTI("find_device_link : %#x", (unsigned long)link);
+        }
+        if (link != NULL && link == p_sdio->link)
+        {
+            device_link_del(p_sdio->link);
+            BTI("Success to del device link");
+        }
+        p_sdio->link = NULL;
+    }
+}
+#endif
 
 static void amlbt_wake_func(struct work_struct *work)
 {
@@ -545,6 +625,40 @@ static void amlbt_unregister_early_suspend(struct platform_device *dev)
     unregister_early_suspend(&sdio_bt.early_suspend);
 }
 
+static void amlbt_sdio_register(void)
+{
+    unsigned int alive = g_sdio_wifi_bt_alive & BIT(1);
+
+    if (alive)
+    {
+        BTI("wifi alive\n");
+    }
+    else if (!g_sdio_driver_insmoded)
+    {
+        BTI("wifi not alive\n");
+        aml_sdio_init();
+        usleep_range(150000, 150000);
+    }
+}
+
+static void amlbt_sdio_unregister(void)
+{
+    unsigned int alive = g_sdio_wifi_bt_alive & BIT(1);
+
+    if (alive)
+    {
+        BTI("wifi alive\n");
+    }
+    else if (g_sdio_driver_insmoded)
+    {
+        BTI("wifi not alive\n");
+        //BTI("aml_bus_state_detect_deinit\n");
+        //aml_bus_state_detect_deinit();
+        BTI("remove wifi sdio device\n");
+        aml_sdio_exit();
+    }
+}
+
 
 static int amlbt_sdio_probe(struct platform_device *dev)
 {
@@ -563,23 +677,19 @@ static void amlbt_sdio_remove(struct platform_device *dev)
 #endif
 }
 
-static void amlbt_suspend_func(void)
+static int amlbt_sdio_suspend(struct platform_device *dev, pm_message_t state)
 {
     w1u_sdio_bt_t *p_sdio = &sdio_bt;
 
     p_sdio->irq_handle = 0;
+    amlbt_write_rclist_to_firmware();
     amlbt_aon_addr_bit_set(RG_AON_A52, 26);
-    BTI("%s \n", __func__);
-}
-
-static int amlbt_sdio_suspend(struct platform_device *dev, pm_message_t state)
-{
     BTI("%s \n", __func__);
 
     return 0;
 }
 
-static void amlbt_resume_func(void)
+static int amlbt_sdio_resume(struct platform_device *dev)
 {
     w1u_sdio_bt_t *p_sdio = &sdio_bt;
 
@@ -591,11 +701,6 @@ static void amlbt_resume_func(void)
     }
 #endif
     BTI("%s\n", __func__);
-}
-
-static int amlbt_sdio_resume(struct platform_device *dev)
-{
-    BTI("%s\n", __func__);
 
     return 0;
 }
@@ -603,7 +708,11 @@ static int amlbt_sdio_resume(struct platform_device *dev)
 static void amlbt_sdio_shutdown(struct platform_device *dev)
 {
     BTI("%s \n", __func__);
-    amlbt_sdio_write_word(RG_BT_PMU_A16, 0);
+    if (sdio_bt.shutdown_value)
+    {
+        amlbt_write_rclist_to_firmware();
+    }
+    //amlbt_sdio_write_word(RG_BT_PMU_A16, 0);
 }
 
 static int parse_int_value(char *start, const char *key, int *value)
@@ -683,7 +792,6 @@ static int amlbt_load_conf(w1u_sdio_bt_t *p_bt)
     return 0;
 }
 
-#ifdef W1U_FW_PATCH
 static int amlbt_sdio_download_firmware(w1u_sdio_bt_t *p_sdio, unsigned int add_size)
 {
     int ret = 0;
@@ -808,7 +916,7 @@ error:
 static int amlbt_load_firmware(w1u_sdio_bt_t *p_bt)
 {
     int ret = 0;
-    //unsigned int reg = 0;
+    unsigned int reg = 0;
     const struct firmware *fw_entry = NULL;
     unsigned int iccm_size;
     unsigned int dccm_size;
@@ -833,6 +941,17 @@ static int amlbt_load_firmware(w1u_sdio_bt_t *p_bt)
     BTI("Firmware loaded successfully, iccm_size: %#x, dccm_size:%#x, add_size:%#x\n",
         iccm_size - ICCM_ROM_SIZE, dccm_size, add_size);
 
+    if (dccm_size == W1U_ROM_START_CODE)
+    {
+        BTI("w1u sram code size 0!\n");
+        release_firmware(fw_entry);
+        p_bt->firmware_start = 1;
+        p_bt->iccm_buf = NULL;
+        p_bt->add_buf  = NULL;
+        p_bt->dccm_buf = NULL;
+        return 0;
+    }
+
     p_bt->iccm_buf = &fw_entry->data[ICCM_ROM_SIZE + 12];
     p_bt->add_buf = &fw_entry->data[iccm_size + 12];
     p_bt->dccm_buf = &fw_entry->data[iccm_size + add_size + 12];
@@ -844,6 +963,11 @@ static int amlbt_load_firmware(w1u_sdio_bt_t *p_bt)
         BTE("Download firmware failed!!\n");
         return ret;
     }
+    reg = amlbt_sdio_read_word(RG_AON_A53);
+    reg &= 0xff7fffff;
+    reg |= (p_bt->system << 23);
+    amlbt_sdio_write_word(RG_AON_A53, reg);
+
     //reg = amlbt_sdio_read_word(REG_PMU_POWER_CFG);
     //reg |= ((p_bt->antenna << BIT_RF_NUM)|(p_bt->bt_sink << BT_SINK_MODE));
     //amlbt_sdio_write_word(REG_PMU_POWER_CFG, reg);
@@ -854,7 +978,6 @@ static int amlbt_load_firmware(w1u_sdio_bt_t *p_bt)
     p_bt->dccm_buf = NULL;
     return 0;
 }
-#endif
 
 static void amlbt_show_fw_debug_info(void)
 {
@@ -876,11 +999,11 @@ static void amlbt_show_fw_debug_info(void)
 
 static int amlbt_sdio_fops_open(struct inode *inode, struct file *file)
 {
-#ifdef W1U_FW_PATCH
     int ret = 0;
-#endif
+
     BTI("%s, version:%s \n", __func__, AML_W1US_VERSION);
     file->private_data = &sdio_bt;
+    amlbt_sdio_register();
 
     amlbt_aon_addr_bit_clr(RG_AON_A52, 26); //clear suspend bit
 
@@ -889,7 +1012,6 @@ static int amlbt_sdio_fops_open(struct inode *inode, struct file *file)
         return -ENOMEM;
     }
     amlbt_load_conf(&sdio_bt);
-#ifdef W1U_FW_PATCH
     ret = amlbt_load_firmware(&sdio_bt);
     if (ret != 0)
     {
@@ -897,13 +1019,12 @@ static int amlbt_sdio_fops_open(struct inode *inode, struct file *file)
         amlbt_sdio_res_deinit(&sdio_bt);
         goto exit;
     }
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+    amlbt_bind_bus();
 #endif
     amlbt_register_interrupt_gpio(&sdio_bt);
-    return nonseekable_open(inode, file);
-#ifdef W1U_FW_PATCH
 exit:
     return nonseekable_open(inode, file);
-#endif
 }
 
 static int amlbt_sdio_fops_close(struct inode *inode, struct file *file)
@@ -914,6 +1035,10 @@ static int amlbt_sdio_fops_close(struct inode *inode, struct file *file)
     amlbt_unregister_interrupt_gpio(&sdio_bt);
     amlbt_sdio_res_deinit(&sdio_bt);
     amlbt_sdio_write_word(RG_AON_A15, 0);
+    if (!sdio_bt.shutdown_value)
+    {
+        amlbt_sdio_unregister();
+    }
 
     return 0;
 }
@@ -961,9 +1086,41 @@ int amlbt_w1us_init(void)
     amlbt_sdio_create_device(&sdio_bt);
     amlbt_register_early_suspend(p_device);
     amlbt_input_device_init(p_device);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+        amlbt_bind_bus();
+#endif
+    amlbt_rc_list_init(sdio_bt.dev_device, NULL, NULL, amlbt_sdio_write_word, amlbt_sdio_read_word);
 
     return ret;
 }
+
+static long amlbt_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
+{
+    switch (cmd)
+    {
+        case IOCTL_SET_BT_SHUTDOWN:
+        {
+            if (copy_from_user(&sdio_bt.shutdown_value, (unsigned char __user *)arg, sizeof(unsigned long)) != 0)
+            {
+                BTE("IOCTL_SET_BT_SHUTDOWN copy error\n");
+                return -EFAULT;
+            }
+            BTI("IOCTL_SET_BT_SHUTDOWN %#x\n", sdio_bt.shutdown_value);
+        }
+        break;
+    }
+    return 0;
+}
+
+#ifdef CONFIG_COMPAT
+static long amlbt_compat_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
+{
+    long ret = 0;
+
+    ret = amlbt_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
+    return ret;
+}
+#endif
 
 void amlbt_w1us_exit(void)
 {
@@ -972,6 +1129,10 @@ void amlbt_w1us_exit(void)
 
     BTI("%s, log level:%d \n", __func__, g_dbg_level);
 
+    amlbt_rc_list_deinit(sdio_bt.dev_device);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+        amlbt_unbind_bus();
+#endif
     amlbt_input_device_deinit();
     amlbt_unregister_early_suspend(p_device);
     amlbt_sdio_destroy_device(&sdio_bt);

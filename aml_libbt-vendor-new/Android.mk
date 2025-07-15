@@ -21,6 +21,7 @@ LOCAL_SRC_FILES := \
         src/conf.c \
         src/FallthroughBTA.cpp \
         src/sysbridge.cpp \
+        src/iwpriv_utility.c \
         src/interface_uart/w1_vendor.c \
         src/interface_uart/w1u_vendor.c \
         src/interface_uart/w2_vendor.c \

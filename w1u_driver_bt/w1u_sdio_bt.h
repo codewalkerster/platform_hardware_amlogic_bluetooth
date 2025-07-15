@@ -1,3 +1,11 @@
+/*
+* Copyright (c) 202X Amlogic, Inc. All rights reserved.
+*
+* This source code is subject to the terms and conditions defined in the
+* file 'LICENSE' which is part of this source code package.
+*
+* Description:
+*/
 #ifndef __W1U_SDIO_BT_H__
 #define __W1U_SDIO_BT_H__
 
@@ -12,6 +20,7 @@ typedef struct
     unsigned int irq_handle;
     struct work_struct wake_work;
     struct input_dev *input_dev;
+    struct device_link *link;
     const unsigned char *iccm_buf;
     const unsigned char *dccm_buf;
     const unsigned char *add_buf;
@@ -26,6 +35,7 @@ typedef struct
     unsigned int factory;
     unsigned int system;
     unsigned char firmware_start;
+    unsigned long shutdown_value;
 } w1u_sdio_bt_t;
 
 /*

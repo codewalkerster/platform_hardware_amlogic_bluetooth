@@ -75,7 +75,9 @@ unsigned int amlbt_fwlog_config = 0;
 unsigned int amlbt_manf_cnt = 0;
 unsigned int amlbt_factory = 0;
 unsigned int amlbt_system = 0;
+unsigned int amlbt_manf_para = 0;
 unsigned char APCF_config_manf_data[256] = {'\0'};
+unsigned char w1u_manf_data[MANF_ROW][MANF_COLUMN] = {0};
 
 /******************************************************************************
 **  Static variables
@@ -207,6 +209,36 @@ static int manf_data_split(char *p)
     return j;
 }
 
+static int w1u_manf_data_split(char *p)
+{
+    int tmp = 0;
+    int i = 0, j = 0, index = 0;
+
+    while (i < strlen(p))
+    {
+        sscanf(p + i, "%2x", &tmp);
+        //ALOGD("%#02x", tmp);
+        if (tmp < 0 || tmp > 0xff)
+        {
+            ALOGE("%#02x", tmp);
+            return 0;
+        }
+        w1u_manf_data[index][j++] = *((unsigned char*)&tmp);
+
+        if (isspace(*(p+2+i)))
+        {
+            i += 3;
+            index++;
+            j = 0;
+        }
+        else
+        {
+            i += 2;
+        }
+    }
+    return index;
+}
+
 void load_aml_stack_conf()
 {
     char *str;
@@ -297,6 +329,18 @@ void load_aml_stack_conf()
             }
             ALOGE("%s manf cnt %d", __func__, amlbt_manf_cnt);
         }
+        else if (!strcmp(aml_trim(line_f), "W1UManfData")) {
+            str = aml_trim(split+1);
+            ALOGE("%s manfdata '%s' len %d", __func__, str, strlen(str));
+            if (strlen(str) < 2)
+            {
+                ALOGE("%s manfdata error", __func__);
+            }
+            else
+            {
+                w1u_manf_data_split(str);
+            }
+        }
         else if (!strcmp(aml_trim(line_f), "Btfactory")) {
             amlbt_factory = strtol(aml_trim(split+1), &endptr, 0);
             ALOGE("%s amlbt_factory '%#x'", __func__, amlbt_factory);
@@ -304,6 +348,10 @@ void load_aml_stack_conf()
         else if (!strcmp(aml_trim(line_f), "Btsystem")) {
             amlbt_system = strtol(aml_trim(split+1), &endptr, 0);
             ALOGE("%s amlbt_system '%#x'", __func__, amlbt_system);
+        }
+        else if (!strcmp(aml_trim(line_f), "Manfcnt")) {
+            amlbt_manf_para = strtol(aml_trim(split+1), &endptr, 0);
+            ALOGE("%s amlbt_manf_para '%#x'", __func__, amlbt_manf_para);
         }
     }
     fclose(fp);

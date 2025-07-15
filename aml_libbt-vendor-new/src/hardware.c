@@ -109,7 +109,6 @@ char *amlbt_fw_bin[AML_BT_CHIP_TYPE][AML_BT_INTF_TYPE] =
 #define BTM_SCO_CODEC_CVSD 0x0001
 #define AML_DOWNLOADFW_UART
 #define AML_FW_BIN
-//#define W1U_FW_PATCH
 
 #ifdef AML_DOWNLOADFW_UART
     #ifdef AML_FW_FILE
@@ -173,6 +172,7 @@ enum
     HW_CFG_AML_DOWNLOAD_FIRMWARE_START_CPU_UART_BEFORE,
     HW_CFG_AML_DOWNLOAD_FIRMWARE_START_CPU_UART,
     HW_CFG_SET_PARAMS,
+    HW_CFG_SET_WAVEFORM_DATA,
     HW_CFG_SET_BD_ADDR,
     /*       hardware undownload config       */
     HW_CFG_SET_WAKEUP_PARAMS,
@@ -193,6 +193,7 @@ uint8_t hw_cfg_fwlog_output(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_download_firmware_start_cpu_uart_before(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_download_firmware_start_cpu_uart(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_set_params(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
+uint8_t hw_cfg_set_waveform_data(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_set_bd_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 uint8_t hw_cfg_get_reg(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p);
 /*       hardware undownload config       */
@@ -214,6 +215,7 @@ uint8_t (*hw_config_func[])(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p) =
     hw_cfg_download_firmware_start_cpu_uart_before,
     hw_cfg_download_firmware_start_cpu_uart,
     hw_cfg_set_params,
+    hw_cfg_set_waveform_data, //w1u
     hw_cfg_set_bd_addr,
     /*       hardware undownload config       */
     hw_cfg_set_wakeup_params,
@@ -237,6 +239,8 @@ extern unsigned char APCF_config_manf_data[256];
 extern unsigned int amlbt_manf_cnt;
 extern unsigned int amlbt_factory;
 extern unsigned int amlbt_system;
+extern unsigned int amlbt_manf_para;
+extern unsigned char w1u_manf_data[MANF_ROW][MANF_COLUMN];
 
 /******************************************************************************
 **  Static variables
@@ -723,7 +727,14 @@ static uint8_t hw_config_set_bdaddr(HC_BT_HDR *p_buf)
     *p = vnd_local_bd_addr[0];
 
     p_buf->len = HCI_CMD_PREAMBLE_SIZE + BD_ADDR_LEN;
-    hw_cfg_cb.state = HW_CFG_SET_BD_ADDR;
+    if (amlbt_transtype.family_id == AML_W1U)
+    {
+        hw_cfg_cb.state = HW_CFG_SET_WAVEFORM_DATA;
+    }
+    else
+    {
+        hw_cfg_cb.state = HW_CFG_SET_BD_ADDR;
+    }
     retval = bt_vendor_cbacks->xmit_cb(HCI_VSC_WRITE_BD_ADDR, p_buf, \
                                        hw_config_cback);
 
@@ -860,7 +871,7 @@ static int hw_config_get_iccm_size(void)
     }
     close(fd);
 
-    BTHWDBG("---------hw_config_get_iccm_size iccm_size %d---------\n", iccm_size);
+    BTHWDBG("---------hw_config_get_iccm_size iccm_size %#x---------\n", iccm_size);
     return iccm_size;
 }
 
@@ -891,7 +902,7 @@ static int hw_config_get_dccm_size(void)
         close(fd);
         return 0;
     }
-#ifdef W1U_FW_PATCH
+
     //W1U skip 15KB additional iccm
     if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
     {
@@ -902,9 +913,9 @@ static int hw_config_get_dccm_size(void)
             close(fd);
             return 0;
         }
-        BTHWDBG("---------hw_config_get_add_iccm_size %d---------\n", add_iccm);
+        BTHWDBG("---------hw_config_get_add_iccm_size %#x---------\n", add_iccm);
     }
-#endif
+
     size = read(fd, &dccm_size, 4);
     if (size < 0)
     {
@@ -914,7 +925,18 @@ static int hw_config_get_dccm_size(void)
     }
     close(fd);
 
-    BTHWDBG("---------hw_config_get_dccm_size dccm_size %d---------\n", dccm_size);
+    BTHWDBG("---------hw_config_get_dccm_size dccm_size %#x---------\n", dccm_size);
+
+    if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
+    {
+        if (dccm_size == W1U_ROM_START_CODE)
+        {
+            BTHWDBG("---------w1u sram code size 0---------\n");
+            dccm_size = add_iccm;
+            add_iccm = 0;
+        }
+    }
+
     return dccm_size;
 }
 
@@ -1247,6 +1269,101 @@ uint8_t hw_cfg_set_params(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
             hw_cfg_cb.fw_fd = -1;
         }
     }
+    return is_proceeding;
+}
+
+uint8_t hw_cfg_set_waveform_data(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
+{
+    int i = 0;
+    int total_len = 0;
+    unsigned int cnt_data = 0;
+    HC_BT_HDR *p_evt_buf = (HC_BT_HDR *)p_mem;
+    char local_ver[128];
+    char chip_name[128] = {0};
+    uint8_t default_manf_data[] = {0x05, 0x19, 0xff, 0x01, 0x0a, 0xb}; //public version
+    uint8_t *total_manf_data = NULL;
+
+    char *p_tmp = (char *)(p_evt_buf + 1) + \
+                  HCI_EVT_CMD_CMPL_LOCAL_FW_VERSION;
+    uint8_t is_proceeding = FALSE;
+
+    property_get("persist.vendor.bt_name", chip_name, "unknown");
+    int year = 2020 + (*(p_tmp + 1) >> 4)%16;
+    int month= (*(p_tmp + 1) & 0x0F)%16;
+
+    BTHWDBG("BT Controller model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x", chip_name,year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
+    sprintf(local_ver, "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
+
+    if (property_set(VENDOR_AMLBTVER_PROPERTY, (char *)local_ver) < 0)
+    {
+        ALOGE("%s:Failed to set amlbt version in %s", __func__, VENDOR_AMLBTVER_PROPERTY);
+    }
+    if (amlbt_manf_para == 0)
+    {
+        UINT16_TO_STREAM(p, HCI_VSC_WAKE_WRITE_DATA);
+        for (i = 0; i < sizeof(default_manf_data); i++)
+            *p++ = default_manf_data[i];
+        p_buf->len = HCI_CMD_PREAMBLE_SIZE + default_manf_data[0];
+        hw_cfg_cb.state = HW_CFG_SET_MANU_DATA;
+        //Set ADV parameter of remote controller using to wake up device when suspend
+        is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_WAKE_WRITE_DATA, p_buf, hw_config_cback);
+        ALOGE("%s aml_bt config manf error use default", __func__);
+
+        return is_proceeding;
+    }
+    total_manf_data = malloc(LOCAL_BDADDR_PATH_BUFFER_LEN);
+    if (!total_manf_data)
+    {
+        ALOGE("total_manf_data Memory allocation failed!");
+        return FALSE;
+    }
+    memset(total_manf_data, 0, LOCAL_BDADDR_PATH_BUFFER_LEN);
+    while (cnt < MANF_ROW)
+    {
+        if (BIT(cnt) & amlbt_manf_para)
+        {
+            if ((total_len + w1u_manf_data[cnt][0] + 1) > LOCAL_BDADDR_PATH_BUFFER_LEN)
+            {
+                ALOGE("Buffer overflow!");
+                break;
+            }
+            else
+            {
+                memcpy(&total_manf_data[total_len], w1u_manf_data[cnt], w1u_manf_data[cnt][0] + 1);
+                /*ALOGD("%#x %#x %#x %#x %#x %#x %#x %#x", total_manf_data[total_len], total_manf_data[total_len+1],
+                        total_manf_data[total_len+2], total_manf_data[total_len+3],
+                        total_manf_data[total_len+4], total_manf_data[total_len+5],
+                        total_manf_data[total_len+6], total_manf_data[total_len+7]);*/
+                total_len += w1u_manf_data[cnt][0] + 1;
+                ALOGD("%#x %#x %#x %#x %#x %#x %#x %#x", w1u_manf_data[cnt][0], w1u_manf_data[cnt][1],
+                        w1u_manf_data[cnt][2], w1u_manf_data[cnt][3],
+                        w1u_manf_data[cnt][4], w1u_manf_data[cnt][5],
+                        w1u_manf_data[cnt][6], w1u_manf_data[cnt][7]);
+                cnt_data++;
+            }
+        }
+        cnt++;
+    }
+    //ALOGD("%#x %#x", cnt_data, total_len);
+    UINT16_TO_STREAM(p, HCI_VSC_WAKE_WRITE_DATA);
+    UINT8_TO_STREAM(p, total_len + 1);
+    UINT8_TO_STREAM(p, cnt_data);
+    for (i = 0; i < total_len; i++)
+    {
+        *p++ = total_manf_data[i];
+    }
+
+    p_buf->len = HCI_CMD_PREAMBLE_SIZE + 1 + total_len;
+
+    hw_cfg_cb.state = HW_CFG_SET_MANU_DATA;
+    //Set ADV parameter of remote controller using to wake up device when suspend
+    is_proceeding = bt_vendor_cbacks->xmit_cb(HCI_VSC_WAKE_WRITE_DATA, p_buf, hw_config_cback);
+    if (total_manf_data)
+    {
+        free(total_manf_data);
+        total_manf_data = NULL;
+    }
+
     return is_proceeding;
 }
 
@@ -1810,8 +1927,7 @@ void hw_config_start(void)
 
                 if ((fw_fd = open_file(file, O_RDONLY)) > 0)
                 {
-#ifdef W1U_FW_PATCH
-                    if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
+                    if (add_iccm != 0 && amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
                     {
                         size = read(fw_fd, tempBuf, 12);
                         if (size < 0)
@@ -1822,7 +1938,6 @@ void hw_config_start(void)
                         }
                     }
                     else
-#endif
                     {
                         size = read(fw_fd, tempBuf, 8);
                         if (size < 0)
@@ -1839,7 +1954,6 @@ void hw_config_start(void)
                         close(fw_fd);
                         return ;
                     }
-#ifdef W1U_FW_PATCH
                     //W1U skip 15KB additional iccm
                     if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
                     {
@@ -1853,7 +1967,6 @@ void hw_config_start(void)
                         }
                         BTHWDBG("w1u skip additional iccm result %d", size);
                     }
-#endif
                     size = read(fw_fd, p_dccm_buf, dccm_size);
                     BTHWDBG("p_dccm_buf [%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]",
                         p_dccm_buf[0],p_dccm_buf[1],p_dccm_buf[2],p_dccm_buf[3],

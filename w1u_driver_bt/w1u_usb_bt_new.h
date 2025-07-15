@@ -1,3 +1,11 @@
+/*
+* Copyright (c) 202X Amlogic, Inc. All rights reserved.
+*
+* This source code is subject to the terms and conditions defined in the
+* file 'LICENSE' which is part of this source code package.
+*
+* Description:
+*/
 #ifndef __W1U_USB_BT_NEW_H__
 #define __W1U_USB_BT_NEW_H__
 
@@ -21,6 +29,7 @@ typedef struct
     unsigned int fw_log;
     unsigned int driver_log;
     unsigned int factory;
+    unsigned int system;
     unsigned int rd_state; //read state
 
     gdsl_fifo_t *fw_type_fifo;              //-->g_rx_type_fifo
@@ -47,8 +56,6 @@ typedef struct
     struct semaphore sr_sem;
     unsigned char usb_irq_task_quit;
     wait_queue_head_t rd_wait_queue;
-    struct wakeup_source *amlbt_wakeup_source;
-    unsigned int wake_mux;
     struct device_link *link;
     //input dev
     unsigned int input_key;

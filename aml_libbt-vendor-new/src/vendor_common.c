@@ -244,51 +244,45 @@ int do_write(int fd, unsigned char *buf, int len)
 {
     int ret = 0;
     int write_offset = 1;
-    int write_len = len-1;
+    int write_len = len - 1;
 
+    if (len <= 0)
+    {
+        ALOGE("Invalid write length: %d", len);
+        return -1;
+    }
     ret = write(fd, buf, 1);
-
     if (ret < 0)
     {
-        ALOGD("write failed ret = %d", ret);
+        ALOGE("write failed ret = %d", ret);
         return -1;
     }
     else if (ret == 0)
     {
-        ALOGD("write failed with ret 0");
+        ALOGE("write failed with ret 0");
         return 0;
     }
-
-    do
+    while (write_len > 0)
     {
         ret = write(fd, buf + write_offset, write_len);
         if (ret < 0)
         {
-            ALOGE("%s, write failed ret = %d err = %s", __func__, ret, strerror(errno));
+            ALOGE("write failed ret = %d", ret);
             return -1;
         }
         else if (ret == 0)
         {
-            ALOGE("%s, write failed with ret 0 err = %s", __func__, strerror(errno));
+            ALOGE("write failed with ret 0");
             return 0;
         }
-        else
+        write_len -= ret;
+        write_offset += ret;
+        if (write_len)
         {
-            if (ret < write_len)
-            {
-                ALOGD("%s, Write pending,do write ret = %d err = %s", __func__, ret,
-                      strerror(errno));
-                write_len = write_len - ret;
-                write_offset = ret;
-            }
-            else
-            {
-                ALOGD("Write successful");
-                break;
-            }
+            ALOGE("Write pending, write_len = %d, write_offset = %d, ret = %d", write_len, write_offset, ret);
         }
     }
-    while (1);
+    ALOGD("Write success, write_len = %d, write_offset = %d, ret = %d", write_len, write_offset, ret);
 
     return len;
 }
@@ -426,46 +420,44 @@ int hci_write_cmd(int fd, unsigned char *buf, int len)
     int write_offset = 1;
     int write_len = len - 1;
 
+    if (len <= 0)
+    {
+        ALOGE("Invalid write length: %d", len);
+        return -1;
+    }
     ret = write(fd, buf, 1);
     if (ret < 0)
     {
-        ALOGD("write failed ret = %d", ret);
+        ALOGE("write failed ret = %d", ret);
         return -1;
     }
     else if (ret == 0)
     {
-        ALOGD("write failed with ret 0");
+        ALOGE("write failed with ret 0");
         return 0;
     }
-
-    do
+    while (write_len > 0)
     {
         ret = write(fd, buf + write_offset, write_len);
         if (ret < 0)
         {
-            ALOGD("write failed ret = %d", ret);
+            ALOGE("write failed ret = %d", ret);
             return -1;
         }
         else if (ret == 0)
         {
-            ALOGD("write failed with ret 0");
+            ALOGE("write failed with ret 0");
             return 0;
         }
-        else
+        write_len -= ret;
+        write_offset += ret;
+        if (write_len)
         {
-            write_len -= ret;
-            write_offset += ret;
-            if (write_len)
-            {
-                ALOGD("Write pending, write_len = %d,write_offset = %d,ret = %d", write_len, write_offset, ret);
-            }
-            else
-            {
-                ALOGD("Write success, write_len = %d,write_offset = %d,ret = %d", write_len, write_offset, ret);
-                break;
-            }
+            ALOGE("Write pending, write_len = %d, write_offset = %d, ret = %d", write_len, write_offset, ret);
         }
-    } while (1);
+    }
+    ALOGD("Write success, write_len = %d, write_offset = %d, ret = %d", write_len, write_offset, ret);
+
     return len;
 }
 
@@ -894,7 +886,10 @@ void* aml_15p4_socket(void* arg)
         perror("bind failed:");
         goto done;
     }
-
+    if (chmod(SOCKET_PATH, 0770) == -1) {
+        ALOGE("chmod failed");
+        goto done;
+    }
     if (listen(listenSocket, 5) == -1) {
         ALOGE("listen failed");
         goto done;
