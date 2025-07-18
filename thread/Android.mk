@@ -21,7 +21,6 @@ LOCAL_SYSTEM_EXT_MODULE := true
 #LOCAL_PROPRIETARY_MODULE := true
 LOCAL_MODULE := ot-ctl-aml
 LOCAL_SRC_FILES := 64bit/ot-ctl-aml
-$(info Building for 32-bit architecture ot-ctl-aml)
 LOCAL_MODULE_CLASS := EXECUTABLES
 LOCAL_MODULE_SUFFIX :=
 LOCAL_MODULE_PATH  :=$(TARGET_OUT_SYSTEM_EXT)/bin

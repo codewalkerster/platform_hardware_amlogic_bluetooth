@@ -182,4 +182,6 @@ void userial_vendor_ioctl(userial_vendor_ioctl_op_t op, void *p_data);
 *******************************************************************************/
 int userial_vendor_usb_open(void);
 
+int userial_vendor_devchar_open(void);
+
 #endif /* USERIAL_VENDOR_H */

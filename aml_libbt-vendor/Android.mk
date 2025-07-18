@@ -5,20 +5,30 @@ ifneq ($(BOARD_HAVE_BLUETOOTH_AMLOGIC),)
 include $(CLEAR_VARS)
 
 # androidT and above use packages/modules/Bluetooth/system path
-ifeq ($(filter-out 33 34 35, $(strip $(PLATFORM_SDK_VERSION))), )
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 33 && echo OK),OK)
 BDROID_DIR := $(TOP_DIR)packages/modules/Bluetooth/system
 else
 BDROID_DIR := $(TOP_DIR)system/bt
 endif
 
 LOCAL_SRC_FILES := \
+        src/libbt.c \
+        src/vendor_common.c \
         src/bt_vendor_aml.c \
         src/hardware.c \
         src/userial_vendor.c \
         src/upio.c \
         src/conf.c \
         src/FallthroughBTA.cpp \
-        src/sysbridge.cpp
+        src/sysbridge.cpp \
+        src/iwpriv_utility.c \
+        src/interface_uart/w1_vendor.c \
+        src/interface_uart/w1u_vendor.c \
+        src/interface_uart/w2_vendor.c \
+        src/interface_uart/w2l_vendor.c \
+        src/interface_usb/w1u_vendor.c \
+        src/interface_usb/w2_vendor.c \
+        src/interface_usb/w2l_vendor.c
 
 LOCAL_C_INCLUDES += \
         $(LOCAL_PATH)/include \

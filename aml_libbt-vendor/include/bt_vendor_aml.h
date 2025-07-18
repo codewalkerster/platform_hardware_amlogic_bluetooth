@@ -56,7 +56,7 @@
 
 /* aml configuration files */
 #ifndef AML_VENDOR_LIB_CONF_FILE
-#define AML_VENDOR_LIB_CONF_FILE "/vendor/firmware/aml_bt.conf"
+#define AML_VENDOR_LIB_CONF_FILE "/vendor/lib/firmware/aml_bt.conf"
 #endif
 
 
@@ -67,7 +67,7 @@
 
 /* Location of firmware patch files */
 #ifndef FW_PATCHFILE_LOCATION
-#define FW_PATCHFILE_LOCATION "/vendor/firmware/"  /* maguro */
+#define FW_PATCHFILE_LOCATION "/vendor/lib/firmware/"  /* maguro */
 #endif
 
 #ifndef UART_TARGET_BAUD_RATE
@@ -457,6 +457,7 @@ enum {
     AML_W1,
     AML_W1U,
     AML_W2,
+    AML_W2L,
 };
 
 enum {
@@ -473,6 +474,32 @@ enum {
 
 
 #define AML_15P4_CMD_BUF_SIZE 512
+#define AML_15P4_SOCKET_SIZE  256
+#define HCI_MAX_EVENT_SIZE    260
+
+#define STREAM_TO_UINT16(u16, p) { u16 = ((uint16_t)(*(p)) + (((uint16_t)(*((p) + 1))) << 8)); (p) += 2; }
+#define UINT8_TO_STREAM(p, u8)   { *(p)++ = (uint8_t)(u8); }
+#define UINT16_TO_STREAM(p, u16) { *(p)++ = (uint8_t)(u16); *(p)++ = (uint8_t)((u16) >> 8); }
+#define UINT32_TO_STREAM(p, u32) { *(p)++ = (uint8_t)(u32); *(p)++ = (uint8_t)((u32) >> 8); *(p)++ = (uint8_t)((u32) >> 16); *(p)++ = (uint8_t)((u32) >> 24); }
+
+#define ICCM_RAM_BASE           (0x000000)
+#define DCCM_RAM_BASE           (0xd00000)
+#define WIFI_RAM_BASE           (0x212800)  //15KB
+
+#define RW_OPERATION_SIZE                       (248)
+#define TCI_READ_REG                            0xfef0
+#define TCI_WRITE_REG                           0xfef1
+#define TCI_UPDATE_UART_BAUDRATE                0xfef2
+#define TCI_DOWNLOAD_BT_FW                      0xfef3
+#define AML_BT_CHIP_TYPE                        5
+#define AML_BT_INTF_TYPE                        3
+#define MANF_ROW                                16
+#define MANF_COLUMN                             16
+
+/*baudrate define FPGA*/
+//#define FPGA_ENABLE
+//#define UART_2M
+#define UART_4M
 
 /* h/w config control block */
 typedef struct
@@ -483,19 +510,24 @@ typedef struct
     char	local_chip_name[LOCAL_NAME_BUFFER_LEN];
 } bt_hw_cfg_cb_t;
 
+struct aml_coex_msg
+{
+    unsigned char  type;
+    unsigned char param[AML_15P4_SOCKET_SIZE];
+};
+
+//#define SOCKET_PATH "/vendor/xbin/socket_coex"
+#define SOCKET_PATH "/data/vendor/bluetooth/socket_coex"
 
 /******************************************************************************
 **  Extern variables and functions
 ******************************************************************************/
 
 extern aml_chip_type amlbt_transtype;
-
+extern bt_hw_cfg_cb_t hw_cfg_cb;
 extern bt_vendor_callbacks_t *bt_vendor_cbacks;
 
 extern int hw_set_audio_state(bt_vendor_op_audio_state_t *p_state);
-
 static size_t kverLength = sizeof("XXXX = XX.XX,XXXXXX = XXXXXX") - 1;
-
-void load_aml_stack_conf();
 
 #endif /* BT_VENDOR_AML_H */

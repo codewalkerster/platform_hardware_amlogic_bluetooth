@@ -6,8 +6,15 @@ M ?= $(PWD)
 
 AMLBT_MOD_NAME = aml_bt
 
-AMLBT_CFILES := \
-	amlbt.c
+AMLBT_CFILES := w2_sdio_bt.c \
+				w2_pcie_bt.c \
+				w2_usb_bt_new.c \
+				amlbt.c \
+				common.c \
+				rc_list.c \
+				debug_dev.c \
+				amlbt_utils.c
+#AMLBT_CFILES := amlbt.c
 
 $(AMLBT_MOD_NAME)-objs := $(AMLBT_CFILES:.c=.o)
 
@@ -16,7 +23,14 @@ $(AMLBT_MOD_NAME)-objs := $(AMLBT_CFILES:.c=.o)
 ###############################################################################
 obj-m += $(AMLBT_MOD_NAME).o
 
-EXTRA_CFLAGS += -Wno-pointer-to-int-cast -Wno-format
+EXTRA_CFLAGS += \
+	-Wno-pointer-to-int-cast -Wno-format \
+	-Wno-implicit-fallthrough \
+	-Wno-incompatible-function-pointer-types \
+	-Wno-macro-redefined \
+	-Wno-strict-prototypes \
+	-Wno-unused-variable \
+	-Wno-incompatible-pointer-types
 
 all:
 	make -C $(KERNEL_SRC) M=$(M) KBUILD_EXTRA_SYMBOLS=$(EXTRA_SYMBOLS_PATH_USB_BT) modules

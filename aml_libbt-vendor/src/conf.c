@@ -57,9 +57,9 @@ int hw_set_patch_settlement_delay(char *p_conf_name, char *p_conf_value, int par
 typedef int (conf_action_t)(char *p_conf_name, char *p_conf_value, int param);
 
 typedef struct {
-    const char * conf_entry;
-    conf_action_t * p_action;
-    int param;
+	const char *	conf_entry;
+	conf_action_t * p_action;
+	int		param;
 } conf_entry_t;
 
 unsigned int amlbt_poweron =AML_SDIO_EN;
@@ -73,7 +73,11 @@ unsigned int amlbt_br_digit_gain = 0;
 unsigned int amlbt_edr_digit_gain = 0;
 unsigned int amlbt_fwlog_config = 0;
 unsigned int amlbt_manf_cnt = 0;
+unsigned int amlbt_factory = 0;
+unsigned int amlbt_system = 0;
+unsigned int amlbt_manf_para = 0;
 unsigned char APCF_config_manf_data[256] = {'\0'};
+unsigned char w1u_manf_data[MANF_ROW][MANF_COLUMN] = {0};
 
 /******************************************************************************
 **  Static variables
@@ -83,13 +87,13 @@ unsigned char APCF_config_manf_data[256] = {'\0'};
  * Current supported entries and corresponding action functions
  */
 static const conf_entry_t conf_table[] = {
-    { "UartPort",    userial_set_port,   0 },
-    { "FwPatchFilePath",    hw_set_patch_file_path,   0 },
-    { "FwPatchFileName",    hw_set_patch_file_name,   0 },
+	{ "UartPort",		    userial_set_port,		   0 },
+	{ "FwPatchFilePath",	    hw_set_patch_file_path,	   0 },
+	{ "FwPatchFileName",	    hw_set_patch_file_name,	   0 },
 #if (VENDOR_LIB_RUNTIME_TUNING_ENABLED == TRUE)
-    { "FwPatchSettlementDelay", hw_set_patch_settlement_delay, 0 },
+	{ "FwPatchSettlementDelay", hw_set_patch_settlement_delay, 0 },
 #endif
-    { (const char *)NULL,    NULL,   0 }
+	{ (const char *)NULL,	    NULL,			   0 }
 };
 
 
@@ -177,7 +181,7 @@ static char *aml_trim(char *str) {
     return str;
 }
 
-void manf_data_split(char*p)
+static int manf_data_split(char *p)
 {
     int tmp = 0;
     int i=0,j=0;
@@ -189,7 +193,7 @@ void manf_data_split(char*p)
         if (tmp < 0 || tmp > 0xff)
         {
             ALOGE("%#02x", tmp);
-            return;
+            return 0;
         }
         APCF_config_manf_data[j++] = *((unsigned char*)&tmp);
 
@@ -202,6 +206,37 @@ void manf_data_split(char*p)
             i += 2;
         }
     }
+    return j;
+}
+
+static int w1u_manf_data_split(char *p)
+{
+    int tmp = 0;
+    int i = 0, j = 0, index = 0;
+
+    while (i < strlen(p))
+    {
+        sscanf(p + i, "%2x", &tmp);
+        //ALOGD("%#02x", tmp);
+        if (tmp < 0 || tmp > 0xff)
+        {
+            ALOGE("%#02x", tmp);
+            return 0;
+        }
+        w1u_manf_data[index][j++] = *((unsigned char*)&tmp);
+
+        if (isspace(*(p+2+i)))
+        {
+            i += 3;
+            index++;
+            j = 0;
+        }
+        else
+        {
+            i += 2;
+        }
+    }
+    return index;
 }
 
 void load_aml_stack_conf()
@@ -217,11 +252,11 @@ void load_aml_stack_conf()
     ALOGE("%s success to open file '%s'", __func__,
       AML_VENDOR_LIB_CONF_FILE);
     int line_num = 0;
-    char line[1024];
+    char line[1024] = {0};
     //char value[1024];
     while (fgets(line, sizeof(line), fp)) {
         char *line_ptr = aml_trim(line);
-        char line_f[100];
+        char line_f[100] = {0};
         ++line_num;
 
         // Skip blank and comment lines.
@@ -234,14 +269,14 @@ void load_aml_stack_conf()
             continue;
         }
         strncpy(line_f,line_ptr,strlen(line_ptr)-strlen(split));
-       // *split = '\0';
+        // *split = '\0';
         ALOGE("%s  %s  %s", __func__, aml_trim(line_f), aml_trim(split+1));
         char *endptr;
         if (!strcmp(aml_trim(line_f), "BtPowerOn")) {
             amlbt_poweron = strtol(aml_trim(split+1), &endptr, 0);
-            ALOGE("%s amlbt_poweron '%d'", __func__, amlbt_poweron);
+        ALOGE("%s amlbt_poweron '%d'", __func__, amlbt_poweron);
         }
-        else if(!strcmp(aml_trim(line_f), "BtChip")) {
+        else if (!strcmp(aml_trim(line_f), "BtChip")) {
             amlbt_chiptype = strtol(aml_trim(split+1), &endptr, 0);
             ALOGE("%s amlbt_chiptype '%d'", __func__, amlbt_chiptype);
         }
@@ -286,10 +321,37 @@ void load_aml_stack_conf()
             }
             else
             {
-                manf_data_split(str);
+                amlbt_manf_cnt = manf_data_split(str);
             }
-            amlbt_manf_cnt = strlen(APCF_config_manf_data)/6;
-            ALOGE("%s manfdata cnt %d strlen %d", __func__, amlbt_manf_cnt, strlen(APCF_config_manf_data));
+            if (amlbt_manf_cnt % 6 != 0)
+            {
+                amlbt_manf_cnt = 0;
+            }
+            ALOGE("%s manf cnt %d", __func__, amlbt_manf_cnt);
+        }
+        else if (!strcmp(aml_trim(line_f), "W1UManfData")) {
+            str = aml_trim(split+1);
+            ALOGE("%s manfdata '%s' len %d", __func__, str, strlen(str));
+            if (strlen(str) < 2)
+            {
+                ALOGE("%s manfdata error", __func__);
+            }
+            else
+            {
+                w1u_manf_data_split(str);
+            }
+        }
+        else if (!strcmp(aml_trim(line_f), "Btfactory")) {
+            amlbt_factory = strtol(aml_trim(split+1), &endptr, 0);
+            ALOGE("%s amlbt_factory '%#x'", __func__, amlbt_factory);
+        }
+        else if (!strcmp(aml_trim(line_f), "Btsystem")) {
+            amlbt_system = strtol(aml_trim(split+1), &endptr, 0);
+            ALOGE("%s amlbt_system '%#x'", __func__, amlbt_system);
+        }
+        else if (!strcmp(aml_trim(line_f), "Manfcnt")) {
+            amlbt_manf_para = strtol(aml_trim(split+1), &endptr, 0);
+            ALOGE("%s amlbt_manf_para '%#x'", __func__, amlbt_manf_para);
         }
     }
     fclose(fp);

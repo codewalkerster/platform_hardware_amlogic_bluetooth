@@ -19,13 +19,13 @@
 #ifndef LIBBT_H
 #define LIBBT_H
 
-#define AML_LIBBT_VERSION   "AML release: 2025-06-26-1425"
+#define AML_LIBBT_VERSION   "AML release: 2025-07-16-1618"
 #define AML_W1_VERSION      "W1 SDIO VENDOR  release: 2025-04-25-1450"
 #define AML_W1US_VERSION    "W1U SDIO VENDOR release: 2025-06-16-1619"
 #define AML_W1UU_VERSION    "W1U USB VENDOR release: 2025-06-04-2040"
-#define AML_W2S_VERSION     "W2 SDIO VENDOR release: 2025-04-25-1450"
-#define AML_W2U_VERSION     "W2 USB VENDOR release: 2025-04-25-1450"
-#define AML_W2P_VERSION     "W2 PCIE VENDOR release: 2025-04-25-1450"
+#define AML_W2S_VERSION     "W2 SDIO VENDOR release: 2025-07-02-1858-iwpriv"
+#define AML_W2U_VERSION     "W2 USB VENDOR release: 2025-07-02-1809-iwpriv"
+#define AML_W2P_VERSION     "W2 PCIE VENDOR release: 2025-07-16-1905-iwpriv"
 #define AML_W2LS_VERSION    "W2L SDIO VENDOR release: 2025-05-15-1500"
 #define AML_W2LU_VERSION    "W2L USB VENDOR release: 2025-04-25-1450"
 
