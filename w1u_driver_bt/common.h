@@ -375,5 +375,10 @@ typedef unsigned int (*sdio_rw_inf)(unsigned int addr);
 #define INPUT_PHYS                "input_btdrv/input0"
 #define KEY_NETFLIX               133
 
+//wake source
+#define REMOTE_WAKEUP           2 //infrared
+#define BT_WAKEUP               4 //bt powerkey
+#define REMOTE_CUS_WAKEUP       9 //bt netflixkey
+
 #endif
 

@@ -136,7 +136,10 @@ extern struct aml_pm_type g_wifi_pm;
 extern struct sdio_func *aml_priv_to_func(int func_n);
 extern unsigned char g_sdio_driver_insmoded;
 extern unsigned char g_sdio_wifi_bt_alive;
-
+extern unsigned char g_sdio_in_suspend;
+#ifdef CONFIG_AMLOGIC_GX_SUSPEND
+extern unsigned int get_resume_method(void);
+#endif
 //extern unsigned char aml_wifi_detect_bt_status __attribute__((weak));
 
 static w1u_sdio_bt_t sdio_bt = {0};
@@ -166,6 +169,7 @@ static long amlbt_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
 #ifdef CONFIG_COMPAT
 static long amlbt_compat_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
 #endif
+static void amlbt_w1us_resume_work(struct work_struct *work);
 
 static void amlbt_dev_release(struct device *dev)
 {
@@ -326,6 +330,13 @@ static void amlbt_sdio_res_deinit(w1u_sdio_bt_t *p_sdio)
 {
     BTI("%s \n", __func__);
     p_sdio->irq_handle = 0;
+    p_sdio->firmware_start = 0;
+    if (p_sdio->resume_wq != NULL)
+    {
+        flush_workqueue(p_sdio->resume_wq);
+        destroy_workqueue(p_sdio->resume_wq);
+        p_sdio->resume_wq = NULL;
+    }
 }
 
 static int amlbt_sdio_res_init(w1u_sdio_bt_t *p_sdio)
@@ -333,7 +344,12 @@ static int amlbt_sdio_res_init(w1u_sdio_bt_t *p_sdio)
     BTI("%s \n", __func__);
     p_sdio->irq_handle = 0;
     p_sdio->system = 0;
-    p_sdio->shutdown_value = 0;
+    INIT_WORK(&p_sdio->resume_work, amlbt_w1us_resume_work);
+    p_sdio->resume_wq = create_singlethread_workqueue("resume_wq");
+    if (p_sdio->resume_wq == NULL)
+    {
+        BTE("%s create_resume_workqueue failed! \n", __func__);
+    }
 
     return 0;
 }
@@ -483,7 +499,6 @@ static void amlbt_aon_addr_bit_clr(unsigned int addr, unsigned int bit)
     BTI("%#x: %#x", addr, amlbt_sdio_read_word(addr));
 }
 
-/*
 static unsigned int amlbt_aon_addr_bit_get(unsigned int addr, unsigned int bit)
 {
     unsigned int reg_value = 0;
@@ -496,7 +511,93 @@ static unsigned int amlbt_aon_addr_bit_get(unsigned int addr, unsigned int bit)
 
     return bit_value;
 }
-*/
+
+static unsigned int amlbt_fw_pmu_sleep_get(void)
+{
+    unsigned int reg_value = 0;
+
+    reg_value = amlbt_sdio_read_word(RG_BT_PMU_A15);
+    BTI("%s PMU FSM %#x\n", __func__, (reg_value & 0xF));
+
+    if (((reg_value & 0xF) == PMU_SLEEP_MODE) || ((reg_value & 0xF) == PMU_ACT_SLEEP))
+    {
+        return TRUE;
+    }
+    else
+    {
+        return FALSE;
+    }
+}
+
+static int amlbt_wake_fw(void)
+{
+    unsigned int reg_value = 0;
+
+    reg_value = amlbt_sdio_read_word(RG_BT_PMU_A16);
+    reg_value &= ~BIT(0);
+    reg_value |= BIT(1);
+    amlbt_sdio_write_word(RG_BT_PMU_A16, reg_value);
+    reg_value = amlbt_sdio_read_word(RG_BT_PMU_A16);
+
+    BTI("%s RG_BT_PMU_A16 %#x\n", __func__, reg_value);
+    return 0;
+}
+
+static void amlbt_w1us_resume_work(struct work_struct *work)
+{
+    int wait_cnt = 0;
+    unsigned int reg = 0;
+    int retry_cnt = 0;
+    w1u_sdio_bt_t *p_sdio = &sdio_bt;
+
+    while (g_sdio_in_suspend != 0)
+    {
+        usleep_range(10000, 10000);
+        wait_cnt++;
+        if (wait_cnt > 100)
+        {
+            BTF("wifi resume failed!!!!, %#x\n", g_sdio_in_suspend);
+            return ;
+        }
+    }
+
+    //forbid fw sleep
+    amlbt_aon_addr_bit_set(RG_AON_A52, 25);
+    usleep_range(1000, 1000);
+    // wake bt fw
+wake_retry:
+    if (amlbt_fw_pmu_sleep_get() == TRUE)
+    {
+        usleep_range(1000, 1000);
+        amlbt_wake_fw();
+    }
+    wait_cnt = 0;
+    // wait bt fw wake done
+     //fw will clear bit after wake done
+    do
+    {
+        reg = amlbt_aon_addr_bit_get(RG_AON_A52, 29);
+        usleep_range(10000, 10000);
+        if (wait_cnt++ > 5)//wait 50ms
+        {
+            BTE("%s wake fw failed\n", __func__);
+            if (retry_cnt++ < 3)
+                goto wake_retry;
+            break;
+        }
+    } while (reg);
+    amlbt_clear_rclist_from_firmware();
+#ifdef CONFIG_AMLOGIC_GX_SUSPEND
+    BTI("get_resume_method %d, %d\n", get_resume_method(), BT_WAKEUP);
+    if (get_resume_method() != BT_WAKEUP &&
+        get_resume_method() != REMOTE_CUS_WAKEUP &&
+            get_resume_method() != REMOTE_WAKEUP)
+    {
+        p_sdio->irq_handle = 1;
+    }
+#endif
+
+}
 
 static int amlbt_sdio_create_device(w1u_sdio_bt_t *p_sdio)
 {
@@ -654,6 +755,7 @@ static void amlbt_sdio_unregister(void)
         BTI("wifi not alive\n");
         //BTI("aml_bus_state_detect_deinit\n");
         //aml_bus_state_detect_deinit();
+        amlbt_aon_addr_bit_set(RG_AON_A56, 31); // shutdown bit
         BTI("remove wifi sdio device\n");
         aml_sdio_exit();
     }
@@ -680,10 +782,20 @@ static void amlbt_sdio_remove(struct platform_device *dev)
 static int amlbt_sdio_suspend(struct platform_device *dev, pm_message_t state)
 {
     w1u_sdio_bt_t *p_sdio = &sdio_bt;
-
-    p_sdio->irq_handle = 0;
-    amlbt_write_rclist_to_firmware();
-    amlbt_aon_addr_bit_set(RG_AON_A52, 26);
+    if (p_sdio->firmware_start)
+    {
+        if (g_sdio_in_suspend == 0)
+        {
+            amlbt_write_rclist_to_firmware();
+            amlbt_aon_addr_bit_set(RG_AON_A52, 26);//set suspend bit
+            amlbt_aon_addr_bit_clr(RG_AON_A52, 25);//allow fw sleep
+        }
+        else
+        {
+            BTF("%s failed g_sdio_in_suspend %#x\n", __func__, g_sdio_in_suspend);
+        }
+        p_sdio->irq_handle = 0;
+    }
     BTI("%s \n", __func__);
 
     return 0;
@@ -691,15 +803,65 @@ static int amlbt_sdio_suspend(struct platform_device *dev, pm_message_t state)
 
 static int amlbt_sdio_resume(struct platform_device *dev)
 {
+    int wait_cnt = 0;
+    int retry_cnt = 0;
+    unsigned reg = 0;
     w1u_sdio_bt_t *p_sdio = &sdio_bt;
 
-#ifdef  CONFIG_AMLOGIC_GX_SUSPEND
-    BTI("get_resume_method %d, %d\n", get_resume_method(), BT_WAKEUP);
-    if (get_resume_method() != BT_WAKEUP)
+    if (p_sdio->firmware_start)
     {
-        p_sdio->irq_handle = 1;
-    }
+        //wait usb bus ready
+        BTI("g_sdio_in_suspend:%#x\n", g_sdio_in_suspend);
+
+        if (g_sdio_in_suspend != 0)
+        {
+            if (p_sdio->resume_wq == NULL)
+            {
+                BTE("%s create_resume_workqueue failed! \n", __func__);
+            }
+            else
+            {
+                queue_work(p_sdio->resume_wq, &p_sdio->resume_work);
+            }
+        }
+        else
+        {
+            //forbid fw sleep
+            amlbt_aon_addr_bit_set(RG_AON_A52, 25);
+            usleep_range(1000, 1000);
+            // wake bt fw
+wake_retry:
+            if (amlbt_fw_pmu_sleep_get() == TRUE)
+            {
+                usleep_range(1000, 1000);
+                amlbt_wake_fw();
+            }
+            // wait bt fw wake done
+             //fw will clear bit after wake done
+            do
+            {
+                reg = amlbt_aon_addr_bit_get(RG_AON_A52, 29);
+                usleep_range(10000, 10000);
+                if (wait_cnt++ > 5)//wait 50ms
+                {
+                    BTE("%s wake fw failed\n", __func__);
+                    if (retry_cnt++ < 3)
+                        goto wake_retry;
+                    break;
+                }
+            } while (reg);
+            amlbt_clear_rclist_from_firmware();
+#ifdef CONFIG_AMLOGIC_GX_SUSPEND
+            BTI("get_resume_method %d, %d\n", get_resume_method(), BT_WAKEUP);
+            if (get_resume_method() != BT_WAKEUP &&
+                get_resume_method() != REMOTE_CUS_WAKEUP &&
+                    get_resume_method() != REMOTE_WAKEUP)
+            {
+                p_sdio->irq_handle = 1;
+            }
 #endif
+        }
+    }
     BTI("%s\n", __func__);
 
     return 0;
@@ -708,10 +870,6 @@ static int amlbt_sdio_resume(struct platform_device *dev)
 static void amlbt_sdio_shutdown(struct platform_device *dev)
 {
     BTI("%s \n", __func__);
-    if (sdio_bt.shutdown_value)
-    {
-        amlbt_write_rclist_to_firmware();
-    }
     //amlbt_sdio_write_word(RG_BT_PMU_A16, 0);
 }
 
@@ -907,7 +1065,6 @@ error:
     if (add_buf)
     {
         kfree(add_buf);
-        add_buf = NULL;
     }
     return ret;
 }
@@ -968,6 +1125,11 @@ static int amlbt_load_firmware(w1u_sdio_bt_t *p_bt)
     reg |= (p_bt->system << 23);
     amlbt_sdio_write_word(RG_AON_A53, reg);
 
+    reg = amlbt_sdio_read_word(RG_AON_A59);
+    reg &= 0xfffffffc;
+    reg |= (p_bt->fw_log & 0x3);
+    amlbt_sdio_write_word(RG_AON_A59, reg);
+
     //reg = amlbt_sdio_read_word(REG_PMU_POWER_CFG);
     //reg |= ((p_bt->antenna << BIT_RF_NUM)|(p_bt->bt_sink << BT_SINK_MODE));
     //amlbt_sdio_write_word(REG_PMU_POWER_CFG, reg);
@@ -997,6 +1159,17 @@ static void amlbt_show_fw_debug_info(void)
     BTI("pc3 0x200034:%#x\n", value);
 }
 
+static int amlbt_powersave_clear(void)
+{
+    // clear shutdown bit
+    amlbt_aon_addr_bit_clr(RG_AON_A56, 31);
+
+    // clear suspend bit
+    amlbt_aon_addr_bit_clr(RG_AON_A52, 26);
+
+    return 0;
+}
+
 static int amlbt_sdio_fops_open(struct inode *inode, struct file *file)
 {
     int ret = 0;
@@ -1005,7 +1178,7 @@ static int amlbt_sdio_fops_open(struct inode *inode, struct file *file)
     file->private_data = &sdio_bt;
     amlbt_sdio_register();
 
-    amlbt_aon_addr_bit_clr(RG_AON_A52, 26); //clear suspend bit
+    amlbt_powersave_clear();
 
     if (amlbt_sdio_res_init(&sdio_bt) != 0)
     {
@@ -1035,10 +1208,8 @@ static int amlbt_sdio_fops_close(struct inode *inode, struct file *file)
     amlbt_unregister_interrupt_gpio(&sdio_bt);
     amlbt_sdio_res_deinit(&sdio_bt);
     amlbt_sdio_write_word(RG_AON_A15, 0);
-    if (!sdio_bt.shutdown_value)
-    {
-        amlbt_sdio_unregister();
-    }
+    amlbt_write_rclist_to_firmware();
+    amlbt_sdio_unregister();
 
     return 0;
 }
@@ -1096,19 +1267,6 @@ int amlbt_w1us_init(void)
 
 static long amlbt_ioctl(struct file* filp, unsigned int cmd, unsigned long arg)
 {
-    switch (cmd)
-    {
-        case IOCTL_SET_BT_SHUTDOWN:
-        {
-            if (copy_from_user(&sdio_bt.shutdown_value, (unsigned char __user *)arg, sizeof(unsigned long)) != 0)
-            {
-                BTE("IOCTL_SET_BT_SHUTDOWN copy error\n");
-                return -EFAULT;
-            }
-            BTI("IOCTL_SET_BT_SHUTDOWN %#x\n", sdio_bt.shutdown_value);
-        }
-        break;
-    }
     return 0;
 }
 

@@ -21,6 +21,8 @@ typedef struct
     struct work_struct wake_work;
     struct input_dev *input_dev;
     struct device_link *link;
+    struct workqueue_struct *resume_wq;
+    struct work_struct resume_work;
     const unsigned char *iccm_buf;
     const unsigned char *dccm_buf;
     const unsigned char *add_buf;
@@ -35,7 +37,6 @@ typedef struct
     unsigned int factory;
     unsigned int system;
     unsigned char firmware_start;
-    unsigned long shutdown_value;
 } w1u_sdio_bt_t;
 
 /*

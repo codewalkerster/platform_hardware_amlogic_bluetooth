@@ -326,6 +326,9 @@ struct aml_bus_state_detect {
   int (*insmod_drv)(void);
 };
 
+#ifdef CONFIG_AMLOGIC_GX_SUSPEND
+extern unsigned int get_resume_method(void);
+#endif
 extern struct mutex auc_usb_mutex;
 extern struct usb_device *g_udev;
 extern struct aml_pm_type g_wifi_pm;
@@ -1623,10 +1626,10 @@ static int amlbt_resume(struct platform_device *dev)
             /* interrupted, exit */
             BTE("%s:%d %d wait sr_sem fail!\n", __func__, __LINE__, ret);
             amlbt_drv_state_set(BT_DRV_STATE_RECOVERY);
-            return -1;
+            ret = 0; //SWPL-222378 use-after-free
         }
     }
-    return 0;
+    return ret;
 }
 
 static void amlbt_shutdown(struct platform_device *dev)
@@ -1875,6 +1878,11 @@ static int amlbt_load_firmware(w1u_usb_bt_new_t *p_bt)
     reg &= 0xff7fffff;
     reg |= (p_bt->system << 23);
     amlbt_write_word(RG_AON_A53, reg, USB_EP1);
+
+    amlbt_read_word(RG_AON_A59, USB_EP1, &reg);
+    reg &= 0xfffffffc;
+    reg |= (p_bt->fw_log & 0x3);
+    amlbt_write_word(RG_AON_A59, reg, USB_EP1);
 
     p_bt->iccm_buf = NULL;
     p_bt->dccm_buf = NULL;

@@ -60,7 +60,6 @@
 #include "userial_vendor.h"
 #include "vendor_common.h"
 
-static unsigned long bt_shutdown = 1;
 
 static const tUSERIAL_CFG userial_init_cfg =
 {
@@ -192,22 +191,7 @@ static int libbt_op_get_lpm_idle_timeout(int state, int (*fd_array)[])
 static int libbt_op_lpm_set_mode(int state, int (*fd_array)[])
 {
     ALOGD("%s \n", __func__);
-    if (state == BT_VND_PWR_OFF)
-    {
-        property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
-        if (strstr(shutdwon_status, "0userrequested") != NULL)
-        {
-            if (ioctl(bt_sdio_fd, IOCTL_SET_BT_SHUTDOWN, &bt_shutdown) != 0)
-            {
-                ALOGD("ioctl send failed: fd %d, error %s", bt_sdio_fd, strerror(errno));
-            }
-            else
-            {
-                ALOGD("send bt shutdown=%ld\n", bt_shutdown);
-            }
-        }
-        ALOGD("%s \n", __func__);
-    }
+
     return 0;
 }
 
