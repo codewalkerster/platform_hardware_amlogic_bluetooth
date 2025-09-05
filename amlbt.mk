@@ -66,6 +66,8 @@ PRODUCT_PACKAGES += \
   z_permit_open \
   z_permit_close \
   z_throughput_rx_end \
+  z_onoff_on \
+  z_onoff_off \
   ot-ctl-aml \
   otbr-agent-aml \
   libmnl_aml \

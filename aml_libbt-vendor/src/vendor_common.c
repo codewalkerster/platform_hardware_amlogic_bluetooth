@@ -731,7 +731,7 @@ int aml_uart_get_pmu(void)
 
     UINT16_TO_STREAM(p, TCI_READ_REG);
     *p++ = 4;
-    UINT32_TO_STREAM(p, 0xf02078);
+    UINT32_TO_STREAM(p, 0xf03078);
     if (hci_write_cmd(g_userial_fd, cmd, 8) != 8)
     {
         ALOGE("Send failed with ret value: %d", err);
@@ -764,7 +764,7 @@ int aml_uart_get_pmu(void)
         ALOGD("expected_rsp:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]",  \
                 expected_rsp[0],expected_rsp[1],expected_rsp[2],expected_rsp[3],
                 expected_rsp[4],expected_rsp[5],expected_rsp[6],expected_rsp[7]);
-        return -1;
+        return 0;
     }
 
     ALOGD("aml_uart_get_pmu SUCCESS");

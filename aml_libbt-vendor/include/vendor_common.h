@@ -27,6 +27,8 @@
 #define IOCTL_SET_BT_SHUTDOWN                   _IOW(BTUSB_IOC_MAGIC, 7, int)
 #define IOCTL_GET_COEX_STATUS                   _IOR(BTUSB_IOC_MAGIC, 8, int)
 #define IOCTL_REGISTER_SDIO                     _IOW(BTUSB_IOC_MAGIC, 9, int)
+#define IOCTL_UNREGISTER_SDIO                   _IOW(BTUSB_IOC_MAGIC, 10, int)
+#define IOCTL_GET_SDIO_PROBE_STATUS             _IOR(BTUSB_IOC_MAGIC, 11, int)
 
 #define W1U_ROM_START_CODE                      0x0cc0006f
 
@@ -162,9 +164,9 @@ void* aml_15p4_socket(void* arg);
 
 enum
 {
-    FW_MODE_COEX        = 1,
-    FW_MODE_BT_ONLY     = 2,
-    FW_MODE_15P4_ONLY   = 3,
+    FW_MODE_BT_ONLY      = 1,
+    FW_MODE_15P4_ONLY    = 2,
+    FW_MODE_COEX         = 3,
 };
 
 #endif /* VENDOR_COMMON_H */

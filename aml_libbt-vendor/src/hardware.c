@@ -1095,15 +1095,15 @@ uint8_t hw_cfg_download_firmware_dccm_uart(void *p_mem, HC_BT_HDR *p_buf, uint8_
         ALOGI("dccm write over successfully. ");
         hw_cfg_cb.state = HW_CFG_AML_DOWNLOAD_FIRMWARE_CLOSE_EVENT;
         cnt = 0;
-         if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
-       {
-           bt_sdio_fd = userial_vendor_devchar_open();
-           if (bt_sdio_fd < 0)
-           {
-             ALOGD("bluetooth node open failed!");
-             return -1;
-           }
-       }
+        if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
+      {
+        bt_sdio_fd = userial_vendor_devchar_open();
+        if (bt_sdio_fd < 0)
+        {
+          ALOGD("bluetooth node open failed!");
+          return -1;
+        }
+      }
     }
 
     return is_proceeding;
@@ -1254,8 +1254,10 @@ uint8_t hw_cfg_set_params(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
 {
     uint8_t is_proceeding = FALSE;
 
-    ms_delay(300);  //need 300ms delay!!
-
+    //if (amlbt_transtype.family_id == AML_W1U || amlbt_transtype.family_id == AML_W1)
+    {
+        ms_delay(300);  //w1 need 300ms delay!!
+    }
     is_proceeding = hw_config_set_bdaddr(p_buf);
 
     if (is_proceeding == FALSE)
@@ -1797,6 +1799,8 @@ void hw_config_quick_start(void)
     hw_cfg_cb.f_set_baud_2 = FALSE;
 
     ALOGD("hw_config_quick_start-------------\n");
+
+    ms_delay(200);
 
     if (bt_vendor_cbacks)
     {

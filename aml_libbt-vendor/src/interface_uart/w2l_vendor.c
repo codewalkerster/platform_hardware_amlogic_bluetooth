@@ -64,6 +64,7 @@
 //coex dev
 static unsigned char coex_status = 0;
 static int fd_coex = -1;
+static unsigned long bt_shutdown = 1;
 
 static const tUSERIAL_CFG userial_init_cfg =
 {
@@ -114,8 +115,23 @@ open_retry:
     return fd;
 }
 
+static void aml_register_sdio(int fd)
+{
+    if (ioctl(fd, IOCTL_REGISTER_SDIO, NULL) != 0)
+    {
+        ALOGD("ioctl send failed: fd %d, error %s", fd, strerror(errno));
+    }
+    else
+    {
+        ALOGD("w2l register sdio ok\n");
+    }
+}
+
 static int libbt_op_power_ctrl(int state, int (*fd_array)[])
 {
+    int value = 0;
+    int retry = 0;
+    int fd_coex = -1;
     if (state == BT_VND_PWR_OFF)
     {
         property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
@@ -133,8 +149,9 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
                 }
                 else
                 {
-                    ALOGD("15p4 not alive, rmmod driver and power off bt_en");
-                    rmmod("w2l_bt", 60);
+                    //ALOGD("15p4 not alive, rmmod driver and power off bt_en");
+                    //rmmod("w2l_bt", 60);
+                    ALOGD("15p4 not alive, power off bt_en");
                     upio_set_bluetooth_power(UPIO_BT_POWER_OFF);
                 }
             }
@@ -151,6 +168,9 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
     }
     else if (state == BT_VND_PWR_ON)
     {
+        snprintf(driver_pram, sizeof(driver_pram), "amlbt_if_type=%u",
+                *((unsigned short*)&amlbt_transtype));
+        ALOGD("%s %s", __FUNCTION__, driver_pram);
         // bt en on
         if (upio_power_get() == 0)
         {
@@ -159,12 +179,43 @@ static int libbt_op_power_ctrl(int state, int (*fd_array)[])
             ALOGD("end, set bt power");
         }
         rmmod("wifi_comm", 100);
-        snprintf(driver_pram, sizeof(driver_pram), "amlbt_if_type=%u",
-                *((unsigned short*)&amlbt_transtype));
-        ALOGD("%s %s", __FUNCTION__, driver_pram);
         //insmod driver
         insmod("/vendor/lib/modules/w2l_comm.ko", "bus_type=sdio", "w2l_comm", 200);
         insmod("/vendor/lib/modules/w2l_bt.ko", driver_pram, "w2l_bt", 200);
+/*        if (insmod_check("w2l") == 0)
+          {
+              ALOGD("bt only delay 50ms");
+               ms_delay(50);
+           }
+*/
+        fd_coex = amlbt_chardev_coex_open();
+        if (fd_coex < 0)
+        {
+          ALOGD("coex node open failed:%s", strerror(errno));
+          return -1;
+        }
+        aml_register_sdio(fd_coex);
+        while (retry < 60)// 300ms
+        {
+          if (ioctl(fd_coex, IOCTL_GET_SDIO_PROBE_STATUS, &value) == 0)
+          {
+            if (value == 1)
+              break;
+          }
+          ms_delay(5);
+          retry++;
+        }
+
+        if (retry >= 60)
+        {
+          ALOGD("Timeout waiting for g_sdio_after_porbe == 1");
+          close(fd_coex);
+          return -1;
+        }
+        ALOGD("%s retry %d \n", __func__, retry);
+
+        close(fd_coex);
+        fd_coex = -1;
 
         if (amlbt_fw_mode == FW_MODE_COEX)
         {
@@ -269,10 +320,71 @@ static int libbt_op_userial_open(int state, int (*fd_array)[])
     return 1;
 }
 
+static void libbt_set_shutdown_value(void)
+{
+    ALOGD("%s %d\n", __func__, bt_sdio_fd);
+    property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
+
+    if (strstr(shutdwon_status, "0userrequested") != NULL)
+    {
+        if (ioctl(bt_sdio_fd, IOCTL_SET_BT_SHUTDOWN, &bt_shutdown) != 0)
+        {
+            ALOGD("ioctl send failed: fd %d, error %s", bt_sdio_fd, strerror(errno));
+        }
+        else
+        {
+            ALOGD("send bt shutdown=%ld\n", bt_shutdown);
+        }
+    }
+}
+
+static void libbt_unregister_sdio(int fd)
+{
+    ALOGD("%s %d\n", __func__, fd_coex);
+    property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
+
+    if (strstr(shutdwon_status, "0userrequested") == NULL)
+    {
+        if (ioctl(fd, IOCTL_UNREGISTER_SDIO, NULL) != 0)
+        {
+          ALOGD("ioctl send failed: fd %d, error %s", fd, strerror(errno));
+        }
+        else
+        {
+          ALOGD("w2l unregister sdio ok\n");
+        }
+    }
+}
+
+
 static int libbt_op_userial_close(int state, int (*fd_array)[])
 {
+/*    int cnt = 0;
+    unsigned val = 0;
+    unsigned char fw_pc[12] = {0};
+    unsigned char fw_log[516] = {0};
+    unsigned int fw_log_addr = 0x413b60;*/
+
     property_get(PWR_PROP_NAME, shutdwon_status, "unknown");
     ALOGD("%s %s ", __FUNCTION__, shutdwon_status);
+
+/*    ALOGD("try to read pc...");
+    ALOGD("bt pc1:");
+    *(unsigned int *)&fw_pc[0] = amlbt_get_reg(0x200034);
+    ms_delay(5);
+    ALOGD("bt pc2:");
+    *(unsigned int *)&fw_pc[4] = amlbt_get_reg(0x200034);
+    ms_delay(5);
+    ALOGD("bt pc3:");
+    *(unsigned int *)&fw_pc[8] = amlbt_get_reg(0x200034);
+    ALOGD("bt fw log:");
+    for (cnt = 0; cnt < sizeof(fw_log); cnt += 4)
+    {
+        *(unsigned int *)&fw_log[cnt] = amlbt_get_reg(fw_log_addr + cnt);
+    }
+    ALOGD("bt fw log end");
+    save_regs_to_file(fw_pc, sizeof(fw_pc), "/data/vendor/fw_pc.txt");
+    save_regs_with_time_str(fw_log, sizeof(fw_log), "/data/vendor/fw_log_last.txt");*/
 
     //reset fw
     if (hw_cfg_cb.state == 0)
@@ -282,12 +394,14 @@ static int libbt_op_userial_close(int state, int (*fd_array)[])
     //close bt fd
     if (bt_sdio_fd > 0)
     {
+        libbt_set_shutdown_value();
         close(bt_sdio_fd);
         bt_sdio_fd = -1;
     }
     fd_coex = amlbt_chardev_coex_open();
     if (fd_coex > 0)
     {
+        libbt_unregister_sdio(fd_coex);
         coex_status = aml_get_w2l_coex_status(fd_coex);
         close(fd_coex);
         fd_coex = -1;
