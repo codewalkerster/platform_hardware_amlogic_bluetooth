@@ -162,7 +162,7 @@ static int init_rfkill()
 	char path[64];
 	char buf[16];
 	int fd, sz, id;
-	sz = -1;//initial
+
 	if (is_rfkill_disabled())
 		return -1;
 
@@ -302,7 +302,7 @@ int upio_power_get(void)
 {
     char buffer = 0;
     int sz;
-    int fd = -1;
+    int fd;
     int ret = 0;
 
     if (init_rfkill())
@@ -354,7 +354,7 @@ int upio_power_get(void)
 int upio_set_bluetooth_power(int on)
 {
 	int sz;
-	int fd = -1;
+	int fd;
 	int ret = -1;
 	char buffer = '0';
 
@@ -430,7 +430,7 @@ void upio_set(uint8_t pio, uint8_t action, uint8_t polarity __unused)
 {
 	//int rc;
 #if (BT_WAKE_VIA_PROC == TRUE)
-	int fd = -1;
+	int fd;
 	char buffer;
 #endif
 

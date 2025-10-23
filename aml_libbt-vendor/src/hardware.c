@@ -579,127 +579,6 @@ static int hw_strncmp(const char *p_str1, const char *p_str2, const int len)
 
 /*******************************************************************************
 **
-** Function         hw_config_findpatch
-**
-** Description      Search for a proper firmware patch file
-**                  The selected firmware patch file name with full path
-**                  will be stored in the input string parameter, i.e.
-**                  p_chip_id_str, when returns.
-**
-** Returns          TRUE when found the target patch file, otherwise FALSE
-**
-*******************************************************************************/
-static uint8_t hw_config_findpatch(char *p_chip_id_str)
-{
-    DIR *dirp;
-    struct dirent *dp;
-    int filenamelen;
-    uint8_t retval = FALSE;
-
-    BTHWDBG("Target name = [%s]", p_chip_id_str);
-
-    if (strlen(fw_patchfile_name) > 0)
-    {
-        /* If specific filepath and filename have been given in run-time
-         * configuration /etc/bluetooth/bt_vendor.conf file, we will use them
-         * to concatenate the filename to open rather than searching a file
-         * matching to chipset name in the fw_patchfile_path folder.
-         */
-        sprintf(p_chip_id_str, "%s", fw_patchfile_path);
-        if (fw_patchfile_path[strlen(fw_patchfile_path) - 1] != '/')
-        {
-            strcat(p_chip_id_str, "/");
-        }
-        strcat(p_chip_id_str, fw_patchfile_name);
-
-        ALOGI("FW patchfile: %s", p_chip_id_str);
-        return TRUE;
-    }
-
-    if ((dirp = opendir(fw_patchfile_path)) != NULL)
-    {
-        /* Fetch next filename in patchfile directory */
-        while ((dp = readdir(dirp)) != NULL)
-        {
-            /* Check if filename starts with chip-id name */
-            if ((hw_strncmp(dp->d_name, p_chip_id_str, strlen(p_chip_id_str)) \
-                ) == 0)
-            {
-                /* Check if it has .hcd extension */
-                filenamelen = strlen(dp->d_name);
-                if ((filenamelen >= FW_PATCHFILE_EXTENSION_LEN) &&
-                        ((hw_strncmp(
-                              &dp->d_name[filenamelen - FW_PATCHFILE_EXTENSION_LEN], \
-                              FW_PATCHFILE_EXTENSION, \
-                              FW_PATCHFILE_EXTENSION_LEN) \
-                         ) == 0))
-                {
-                    ALOGI("Found patchfile: %s/%s", \
-                          fw_patchfile_path, dp->d_name);
-
-                    /* Make sure length does not exceed maximum */
-                    if ((filenamelen + strlen(fw_patchfile_path)) > \
-                            FW_PATCHFILE_PATH_MAXLEN)
-                    {
-                        ALOGE("Invalid patchfile name (too long)");
-                    }
-                    else
-                    {
-                        memset(p_chip_id_str, 0, FW_PATCHFILE_PATH_MAXLEN);
-                        /* Found patchfile. Store location and name */
-                        strcpy(p_chip_id_str, fw_patchfile_path);
-                        if (fw_patchfile_path[ \
-                                               strlen(fw_patchfile_path) - 1 \
-                                             ] != '/')
-                        {
-                            strcat(p_chip_id_str, "/");
-                        }
-                        strcat(p_chip_id_str, dp->d_name);
-                        retval = TRUE;
-                    }
-                    break;
-                }
-            }
-        }
-
-        closedir(dirp);
-
-        if (retval == FALSE)
-        {
-            /* Try again chip name without revision info */
-
-            int len = strlen(p_chip_id_str);
-            char *p = p_chip_id_str + len - 1;
-
-            /* Scan backward and look for the first alphabet
-             * which is not M or m
-             */
-            while (len > 3) // BCM****
-            {
-                if ((isdigit(*p) == 0) && (*p != 'M') && (*p != 'm'))
-                    break;
-
-                p--;
-                len--;
-            }
-
-            if (len > 3)
-            {
-                *p = 0;
-                retval = hw_config_findpatch(p_chip_id_str);
-            }
-        }
-    }
-    else
-    {
-        ALOGE("Could not open %s", fw_patchfile_path);
-    }
-
-    return (retval);
-}
-
-/*******************************************************************************
-**
 ** Function         hw_config_set_bdaddr
 **
 ** Description      Program controller's Bluetooth Device Address
@@ -940,6 +819,11 @@ static int hw_config_get_dccm_size(void)
     return dccm_size;
 }
 
+static inline bool is_valid_size(unsigned int size)
+{
+    return (size >= MIN_ALLOC_SIZE && size <= MAX_ALLOC_SIZE);
+}
+
 #ifdef AML_DOWNLOADFW_UART
 static void hw_get_bin_size(void)
 {
@@ -969,8 +853,24 @@ static void hw_get_bin_size(void)
 #endif
     offset_dccm = 0;
 #ifdef AML_FW_BIN
+    if (!is_valid_size(iccm_size) || !is_valid_size(dccm_size))
+    {
+        BTHWDBG("is_valid_size error! iccm_size %#x dccm_size %#x\n", iccm_size, dccm_size);
+        return ;
+    }
     p_iccm_buf = malloc(iccm_size);
+    if (!p_iccm_buf)
+    {
+        BTHWDBG("malloc(iccm_size) error!\n");
+        return ;
+    }
     p_dccm_buf = malloc(dccm_size);
+    if (!p_dccm_buf)
+    {
+        BTHWDBG("malloc(dccm_size) error!\n");
+        free(p_iccm_buf);
+        return ;
+    }
 #endif
 }
 #endif
@@ -1095,15 +995,15 @@ uint8_t hw_cfg_download_firmware_dccm_uart(void *p_mem, HC_BT_HDR *p_buf, uint8_
         ALOGI("dccm write over successfully. ");
         hw_cfg_cb.state = HW_CFG_AML_DOWNLOAD_FIRMWARE_CLOSE_EVENT;
         cnt = 0;
-        if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
-      {
-        bt_sdio_fd = userial_vendor_devchar_open();
-        if (bt_sdio_fd < 0)
-        {
-          ALOGD("bluetooth node open failed!");
-          return -1;
-        }
-      }
+         if (amlbt_transtype.family_id == AML_W1U && amlbt_transtype.interface != AML_INTF_USB)
+       {
+           bt_sdio_fd = userial_vendor_devchar_open();
+           if (bt_sdio_fd < 0)
+           {
+             ALOGD("bluetooth node open failed!");
+             return -1;
+           }
+       }
     }
 
     return is_proceeding;
@@ -1254,10 +1154,8 @@ uint8_t hw_cfg_set_params(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
 {
     uint8_t is_proceeding = FALSE;
 
-    //if (amlbt_transtype.family_id == AML_W1U || amlbt_transtype.family_id == AML_W1)
-    {
-        ms_delay(300);  //w1 need 300ms delay!!
-    }
+    ms_delay(300);  //need 300ms delay!!
+
     is_proceeding = hw_config_set_bdaddr(p_buf);
 
     if (is_proceeding == FALSE)
@@ -1292,11 +1190,24 @@ uint8_t hw_cfg_set_waveform_data(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
     int month= (*(p_tmp + 1) & 0x0F)%16;
 
     BTHWDBG("BT Controller model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x", chip_name,year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
-    sprintf(local_ver, "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
+    snprintf(local_ver, sizeof(local_ver), "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
 
     if (property_set(VENDOR_AMLBTVER_PROPERTY, (char *)local_ver) < 0)
     {
         ALOGE("%s:Failed to set amlbt version in %s", __func__, VENDOR_AMLBTVER_PROPERTY);
+    }
+    if (amlbt_transtype.interface == AML_INTF_USB && amlbt_transtype.family_id == AML_W2)
+    {
+        bt_vendor_cbacks->dealloc(p_buf);
+        bt_vendor_cbacks->fwcfg_cb(BT_VND_OP_RESULT_SUCCESS);
+
+        hw_cfg_cb.state = 0;
+        if (hw_cfg_cb.fw_fd != -1)
+        {
+            close(hw_cfg_cb.fw_fd);
+            hw_cfg_cb.fw_fd = -1;
+        }
+        return TRUE;
     }
     if (amlbt_manf_para == 0)
     {
@@ -1361,7 +1272,6 @@ uint8_t hw_cfg_set_waveform_data(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
     if (total_manf_data)
     {
         free(total_manf_data);
-        total_manf_data = NULL;
     }
 
     return is_proceeding;
@@ -1384,7 +1294,7 @@ uint8_t hw_cfg_set_bd_addr(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
         int month= (*(p_tmp + 1) & 0x0F)%16;
 
         BTHWDBG("BT Controller model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x", chip_name,year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
-        sprintf(local_ver, "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
+        snprintf(local_ver, sizeof(local_ver), "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
 
         if (property_set(VENDOR_AMLBTVER_PROPERTY, (char *)local_ver) < 0)
         {
@@ -1455,26 +1365,14 @@ uint8_t hw_cfg_set_wakeup_params(void *p_mem, HC_BT_HDR *p_buf, uint8_t *p)
         int month= (*(p_tmp + 1) & 0x0F)%16;
 
         BTHWDBG("BT Controller model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x", chip_name,year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
-        sprintf(local_ver, "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
+        snprintf(local_ver, sizeof(local_ver), "model=%s,version = %04d.%02d.%02x,number = 0x%02x%02x",chip_name, year,month, *p_tmp, *(p_tmp + 3), *(p_tmp + 2));
 
         if (property_set(VENDOR_AMLBTVER_PROPERTY, (char *)local_ver) < 0)
         {
             ALOGE("%s:Failed to set amlbt version in %s", __func__, VENDOR_AMLBTVER_PROPERTY);
         }
     }
-    if (amlbt_transtype.interface == AML_INTF_USB && amlbt_transtype.family_id == AML_W2)
-    {
-        bt_vendor_cbacks->dealloc(p_buf);
-        bt_vendor_cbacks->fwcfg_cb(BT_VND_OP_RESULT_SUCCESS);
 
-        hw_cfg_cb.state = 0;
-        if (hw_cfg_cb.fw_fd != -1)
-        {
-            close(hw_cfg_cb.fw_fd);
-            hw_cfg_cb.fw_fd = -1;
-        }
-        return TRUE;
-    }
     if (amlbt_manf_cnt == 0)
     {
         UINT16_TO_STREAM(p, HCI_VSC_WAKE_WRITE_DATA);
@@ -1800,8 +1698,6 @@ void hw_config_quick_start(void)
 
     ALOGD("hw_config_quick_start-------------\n");
 
-    ms_delay(200);
-
     if (bt_vendor_cbacks)
     {
         p_buf = (HC_BT_HDR *)bt_vendor_cbacks->alloc(BT_HC_HDR_SIZE + \
@@ -1829,8 +1725,14 @@ void hw_config_quick_start(void)
         *p = vnd_local_bd_addr[0];
 
         p_buf->len = HCI_CMD_PREAMBLE_SIZE + BD_ADDR_LEN;
-
-        hw_cfg_cb.state = HW_CFG_SET_WAKEUP_PARAMS;
+        if (amlbt_transtype.family_id == AML_W2)
+        {
+            hw_cfg_cb.state = HW_CFG_SET_WAVEFORM_DATA;
+        }
+        else
+        {
+            hw_cfg_cb.state = HW_CFG_SET_WAKEUP_PARAMS;
+        }
         bt_vendor_cbacks->xmit_cb(HCI_VSC_WRITE_BD_ADDR, p_buf, hw_config_cback);
     }
     else
@@ -2045,14 +1947,7 @@ uint8_t hw_lpm_enable(uint8_t turn_on)
         {
             ALOGD("LPM enabled!!");
         }
-        if (!turn_on)
-        {
-            if (amlbt_transtype.interface == AML_INTF_USB)
-            {
-                bt_vendor_cbacks->xmit_cb(HCI_VSC_WRITE_SLEEP_MODE,
-                                          p_buf, NULL);
-            }
-        }
+
         if (amlbt_transtype.interface == AML_INTF_PCIE || amlbt_transtype.interface == AML_INTF_SDIO)
         {
             bt_vendor_cbacks->dealloc(p_buf);
@@ -2358,45 +2253,6 @@ int hw_set_audio_state(bt_vendor_op_audio_state_t *p_state)
     return -256;
 }
 #endif
-/*******************************************************************************
-**
-** Function        hw_set_patch_file_path
-**
-** Description     Set the location of firmware patch file
-**
-** Returns         0 : Success
-**                 Otherwise : Fail
-**
-*******************************************************************************/
-int hw_set_patch_file_path(char *p_conf_name __unused, char *p_conf_value __unused, int param __unused)
-{
-#ifdef AML_DOWNLOADFW_UART
-    strcpy(fw_patchfile_path, "/etc/bluetooth/");
-#else
-    strcpy(fw_patchfile_path, p_conf_value);
-#endif
-    return 0;
-}
-
-/*******************************************************************************
-**
-** Function        hw_set_patch_file_name
-**
-** Description     Give the specific firmware patch filename
-**
-** Returns         0 : Success
-**                 Otherwise : Fail
-**
-*******************************************************************************/
-int hw_set_patch_file_name(char *p_conf_name __unused, char *p_conf_value __unused, int param __unused)
-{
-#ifdef AML_DOWNLOADFW_UART
-    strcpy(fw_patchfile_name, "bt_fucode.h");
-#else
-    strcpy(fw_patchfile_name, p_conf_value);
-#endif
-    return 0;
-}
 
 #if (VENDOR_LIB_RUNTIME_TUNING_ENABLED == TRUE)
 /*******************************************************************************
@@ -2453,6 +2309,40 @@ void hw_epilog_cback(void *p_mem)
          * to notify caller */
         bt_vendor_cbacks->epilog_cb(BT_VND_OP_RESULT_SUCCESS);
     }
+}
+
+int hw_set_patch_file_path(char *p_conf_name __unused, char *p_conf_value __unused, int param __unused)
+{
+#ifdef AML_DOWNLOADFW_UART
+    snprintf(fw_patchfile_path, sizeof(fw_patchfile_path), "/etc/bluetooth/");
+#else
+    if (p_conf_value == NULL) return -EINVAL;
+    snprintf(fw_patchfile_path, sizeof(fw_patchfile_path), "%s", p_conf_value);
+#endif
+
+    return 0;
+}
+
+/*******************************************************************************
+**
+** Function        hw_set_patch_file_name
+**
+** Description     Give the specific firmware patch filename
+**
+** Returns         0 : Success
+**                 Otherwise : Fail
+**
+*******************************************************************************/
+int hw_set_patch_file_name(char *p_conf_name __unused, char *p_conf_value __unused, int param __unused)
+{
+#ifdef AML_DOWNLOADFW_UART
+    snprintf(fw_patchfile_name, sizeof(fw_patchfile_name), "bt_fucode.h");
+#else
+    if (p_conf_value == NULL) return -EINVAL;
+    snprintf(fw_patchfile_name, sizeof(fw_patchfile_name), "%s", p_conf_value);
+#endif
+
+    return 0;
 }
 
 /*******************************************************************************

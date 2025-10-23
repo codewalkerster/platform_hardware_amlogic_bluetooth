@@ -34,6 +34,13 @@
 #include <unistd.h>
 #include <utils/Log.h>
 #include <sys/stat.h>
+#include <cutils/properties.h>
+#include <time.h>
+
+#include "vendor_common.h"
+
+#define MAX_LINES 5000000
+#define AVG_LINE_LEN 100
 
 static int sock;
 
@@ -71,7 +78,8 @@ static inline int iw_get_ext(int skfd,       /* Socket to the kernel */
 {
     int ret = 0;
     /* Set device name */
-    strncpy(pwrq->ifr_name, ifname, IFNAMSIZ);
+    strncpy(pwrq->ifr_name, ifname, IFNAMSIZ - 1);
+    pwrq->ifr_name[IFNAMSIZ - 1] = '\0';
 
     ret = ioctl(skfd, request, pwrq);
     if (ret < 0) {
@@ -168,7 +176,7 @@ static int set_private_cmd(int skfd,  /* Socket */
         char *retval)                 /* Return value */
 {
     struct iwreq wrq;
-    char buffer[4096];    /* Only that big in v25 and later */
+    char buffer[4096] = {0};    /* Only that big in v25 and later */
     int i = 0;              /* Start with first command arg */
     int k;                  /* Index in private description table */
     int temp;
@@ -255,7 +263,8 @@ static int set_private_cmd(int skfd,  /* Socket */
         wrq.u.data.length = 0L;
     }
 
-    strncpy(wrq.ifr_name, ifname, IFNAMSIZ);
+    strncpy(wrq.ifr_name, ifname, IFNAMSIZ - 1);
+    wrq.ifr_name[IFNAMSIZ - 1] = '\0';
 
     /* Those two tests are important. They define how the driver
      * will have to handle the data */
@@ -334,6 +343,7 @@ static int set_private_cmd(int skfd,  /* Socket */
 
 void save_regs_to_file(unsigned char *buf, size_t len, const char *filepath)
 {
+#if 0
     FILE *fp = fopen(filepath, "w");
     if (!fp)
     {
@@ -347,12 +357,18 @@ void save_regs_to_file(unsigned char *buf, size_t len, const char *filepath)
     fprintf(fp, "\n");
 
     fclose(fp);
-    chmod(filepath, 0644);
+    if (chmod(filepath, 0644) != 0)
+    {
+        ALOGE("Failed to set file permissions! %s", strerror(errno));
+    }
     ALOGD("save file %s finished!", filepath);
+#else
+#endif
 }
 
 void save_regs_with_time_str(unsigned char *buf, size_t len, const char *filepath)
 {
+#if 0
     FILE *fp = fopen(filepath, "w");
     if (!fp) return;
 
@@ -365,7 +381,12 @@ void save_regs_with_time_str(unsigned char *buf, size_t len, const char *filepat
 
     fprintf(fp, "\n");
     fclose(fp);
-    chmod(filepath, 0644);
+    if (chmod(filepath, 0644) != 0)
+    {
+        ALOGE("Failed to set file permissions! %s", strerror(errno));
+    }
+#else
+#endif
 }
 
 unsigned int amlbt_get_reg(unsigned int addr)
@@ -380,11 +401,16 @@ unsigned int amlbt_get_reg(unsigned int addr)
     unsigned int value = 0;
     char *hex_str;
 
+    return 0; // fw crash, temporarily closed
     if (bt_iwpriv_init() != 0)
         return 0;
 
     priv_num = iw_get_priv_info(sock, ifname, &priv);
     if (priv_num <= 0 || priv == NULL) {
+        ALOGE("iw_get_priv_info err %d", priv_num);
+        if (priv != NULL) {
+            free(priv);
+        }
         bt_iwpriv_close();
         return 0;
     }
@@ -409,4 +435,182 @@ unsigned int amlbt_get_reg(unsigned int addr)
     return value;
 }
 
+
+
+static void write_batch_magic(FILE *fp)
+{
+    char magic[128];
+    time_t now = time(NULL);
+    struct tm tm_now;
+
+    localtime_r(&now, &tm_now);
+    snprintf(magic, sizeof(magic),
+             "=== BATCH START %04d-%02d-%02d %02d:%02d:%02d ===\n",
+             tm_now.tm_year + 1900,
+             tm_now.tm_mon + 1,
+             tm_now.tm_mday,
+             tm_now.tm_hour,
+             tm_now.tm_min,
+             tm_now.tm_sec);
+    ALOGD("%s, magic:%s\n", __FUNCTION__, magic);
+    fputs(magic, fp);
+}
+
+void libbt_save_diag_buff(int fd)
+{
+    struct amlbt_diag_buf *buf = NULL;
+    struct amlbt_diag_remain_buf *remain_buf = NULL;
+    unsigned long diag_cnt = 0;
+    unsigned long version = 0;
+    unsigned int i = 0;
+    char line[512];
+    struct amlbt_diag_entry *entry;
+    const char *file_path = "/data/vendor/fw_log_last.txt";
+    unsigned long line_est = 0;
+    struct stat st;
+    FILE *fp = NULL;
+
+    ALOGD("%s\n", __FUNCTION__);
+
+    if (ioctl(fd, IOCTL_GET_DRIVER_VERSION, &version) != 0) {
+        ALOGE("ioctl send IOCTL_GET_DRIVER_VERSION failed: fd %d, error %s",
+              fd, strerror(errno));
+    }
+    ALOGD("bt driver version:%#lx\n", version);
+
+    if (ioctl(fd, IOCTL_GET_DIAG_COUNT, &diag_cnt) != 0) {
+        ALOGE("ioctl send IOCTL_GET_DIAG_COUNT failed: fd %d, error %s",
+              fd, strerror(errno));
+        return;
+    }
+    if (diag_cnt == 0) {
+        ALOGD("No diag entries, nothing to save.\n");
+        return;
+    }
+    ALOGD("diag entries:%lu\n", diag_cnt);
+
+    buf = malloc(sizeof(struct amlbt_diag_buf) +
+                 diag_cnt * sizeof(struct amlbt_diag_entry));
+    if (!buf) {
+        ALOGE("buf malloc failed!, error %s", strerror(errno));
+        return;
+    }
+    memset(buf, 0, sizeof(struct amlbt_diag_buf) +
+                  diag_cnt * sizeof(struct amlbt_diag_entry));
+    buf->max = diag_cnt;
+    ALOGD("IOCTL_GET_DIAG_BUFF offsetof(entries) = %d\n", offsetof(struct amlbt_diag_buf, entries));
+    if (ioctl(fd, IOCTL_GET_DIAG_BUFF, buf) != 0) {
+        ALOGE("ioctl send IOCTL_GET_DIAG_BUFF failed: fd %d, error %s",
+              fd, strerror(errno));
+        free(buf);
+        return;
+    }
+
+    if (stat(file_path, &st) == 0) {
+        line_est = st.st_size / AVG_LINE_LEN;
+    }
+
+    if (line_est >= MAX_LINES) {
+        ALOGD("line_est=%lu exceeds limit, truncating file\n", line_est);
+        fp = fopen(file_path, "w");
+    } else {
+        fp = fopen(file_path, "a");
+    }
+    if (!fp) {
+        ALOGE("File %s open failed!, error %s", file_path, strerror(errno));
+        free(buf);
+        return;
+    }
+
+    write_batch_magic(fp);
+
+    // write diag entries
+    for (i = 0; i < buf->count; i++) {
+        entry = &buf->entries[i];
+        snprintf(line, sizeof(line),
+                 "info:[%02x,%02x,%02x,%02x,%02x,%02x,%02x], "
+                 "type:%02x, w:0x%08x, r:0x%08x, "
+                 "date:%02u-%02u %02u:%02u:%02u.%03u, f_cnt:%u",
+                 entry->info[0], entry->info[1], entry->info[2],
+                 entry->info[3], entry->info[4], entry->info[5],
+                 entry->info[6],
+                 entry->type,
+                 entry->w, entry->r,
+                 entry->mon, entry->day,
+                 entry->hour, entry->min, entry->sec, entry->ms,
+                 entry->fw_log_cnt);
+        fputs(line, fp);
+        fputc('\n', fp);
+    }
+
+    // write fw log (32 bytes / line)
+    if (buf->fw_log[0] != '\0') {
+        fputs("fw_log:\n", fp);
+        for (int j = 0; j < sizeof(buf->fw_log); j++) {
+            if (j % 32 == 0) {
+                if (j != 0) fputc('\n', fp);
+                fputs("  ", fp); //table
+            }
+            fprintf(fp, "%02x ", buf->fw_log[j]);
+        }
+        fputc('\n', fp);
+    }
+
+    // get remain diag
+    if (ioctl(fd, IOCTL_GET_DIAG_REMAIN_COUNT, &diag_cnt) != 0) {
+        ALOGE("ioctl send IOCTL_GET_DIAG_REMAIN_COUNT failed: fd %d, error %s",
+              fd, strerror(errno));
+        goto exit;
+    }
+
+    if (diag_cnt > 0) {
+        ALOGD("remain diag entries:%lu\n", diag_cnt);
+        remain_buf = malloc(sizeof(struct amlbt_diag_remain_buf) +
+                            diag_cnt * sizeof(struct amlbt_diag_entry));
+        if (!remain_buf) {
+            ALOGE("remain_buf malloc failed!, error %s", strerror(errno));
+            goto exit;
+        }
+        memset(remain_buf, 0, sizeof(struct amlbt_diag_remain_buf) +
+                             diag_cnt * sizeof(struct amlbt_diag_entry));
+        remain_buf->max = diag_cnt;
+
+        if (ioctl(fd, IOCTL_GET_DIAG_REMAIN_BUFF, remain_buf) != 0) {
+            ALOGE("ioctl send IOCTL_GET_DIAG_REMAIN_BUFF failed: fd %d, error %s",
+                  fd, strerror(errno));
+            free(remain_buf);
+            remain_buf = NULL;
+            goto exit;
+        }
+
+        fputs("================== remain skb info ==================\n", fp);
+        for (i = 0; i < remain_buf->count; i++) {
+            entry = &remain_buf->entries[i];
+            snprintf(line, sizeof(line),
+                     "info:[%02x,%02x,%02x,%02x,%02x,%02x,%02x], "
+                     "type:%02x, w:0x%08x, r:0x%08x, "
+                     "date:%02u-%02u %02u:%02u:%02u.%03u, f_cnt:%u",
+                     entry->info[0], entry->info[1], entry->info[2],
+                     entry->info[3], entry->info[4], entry->info[5],
+                     entry->info[6],
+                     entry->type,
+                     entry->w, entry->r,
+                     entry->mon, entry->day,
+                     entry->hour, entry->min, entry->sec, entry->ms,
+                     entry->fw_log_cnt);
+            fputs(line, fp);
+            fputc('\n', fp);
+        }
+    }
+
+exit:
+    if (chmod(file_path, 0644) != 0) {
+        ALOGE("Failed to set file permissions! %s", strerror(errno));
+    }
+    if (fp) fclose(fp);
+    if (buf) free(buf);
+    if (remain_buf) free(remain_buf);
+
+    ALOGD("save file %s finished!", file_path);
+}
 

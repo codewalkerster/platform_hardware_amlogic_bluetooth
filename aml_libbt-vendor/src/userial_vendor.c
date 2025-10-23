@@ -266,22 +266,38 @@ open_retry:
     }
     ALOGE("userial vendor open success!!");
 
-    tcflush(vnd_userial.fd, TCIOFLUSH);
+    if (tcflush(vnd_userial.fd, TCIOFLUSH) == -1)
+    {
+        ALOGE("tcflush failed %s", strerror(errno));
+        close(vnd_userial.fd);
+        vnd_userial.fd = -1;
+        return -1;
+    }
 
-    tcgetattr(vnd_userial.fd, &vnd_userial.termios);
+    if (tcgetattr(vnd_userial.fd, &vnd_userial.termios) == -1)
+    {
+        ALOGE("tcgetattr failed %s", strerror(errno));
+        close(vnd_userial.fd);
+        vnd_userial.fd = -1;
+        return -1;
+    }
+
     cfmakeraw(&vnd_userial.termios);
     vnd_userial.termios.c_cflag |= (CRTSCTS | stop_bits);
-    tcsetattr(vnd_userial.fd, TCSANOW, &vnd_userial.termios);
-    tcflush(vnd_userial.fd, TCIOFLUSH);
-
-    tcsetattr(vnd_userial.fd, TCSANOW, &vnd_userial.termios);
-    tcflush(vnd_userial.fd, TCIOFLUSH);
-    tcflush(vnd_userial.fd, TCIOFLUSH);
 
     /* set input/output baudrate */
     cfsetospeed(&vnd_userial.termios, baud);
     cfsetispeed(&vnd_userial.termios, baud);
-    tcsetattr(vnd_userial.fd, TCSANOW, &vnd_userial.termios);
+
+    if (tcsetattr(vnd_userial.fd, TCSANOW, &vnd_userial.termios) == -1)
+    {
+        ALOGE("tcsetattr failed %s", strerror(errno));
+        close(vnd_userial.fd);
+        vnd_userial.fd = -1;
+        return -1;
+    }
+
+    tcflush(vnd_userial.fd, TCIOFLUSH);
 
 #if (BT_WAKE_VIA_USERIAL_IOCTL == TRUE)
     userial_ioctl_init_bt_wake(vnd_userial.fd);
@@ -414,7 +430,7 @@ void userial_vendor_ioctl(userial_vendor_ioctl_op_t op, void *p_data __unused)
 *******************************************************************************/
 int userial_set_port(char *p_conf_name __unused, char *p_conf_value, int param __unused)
 {
-    strcpy(vnd_userial.port_name, p_conf_value);
+    snprintf(vnd_userial.port_name, sizeof(vnd_userial.port_name), "%s", p_conf_value);
 
     return 0;
 }

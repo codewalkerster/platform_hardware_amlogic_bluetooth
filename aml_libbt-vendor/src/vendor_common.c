@@ -128,10 +128,10 @@ int insmod_check(const char *modname)
 
     if ((modules = fopen("/proc/modules", "r")) == NULL)
     {
-        ALOGW("open /proc/modules failed! err=%s\n", strerror(errno));
+        ALOGE("open /proc/modules failed! err=%s\n", strerror(errno));
         return 0;
     }
-    if ((fgets(line, sizeof(line), modules)) != NULL)
+    while ((fgets(line, sizeof(line), modules)) != NULL)
     {
         module = strtok(line, " ");
         if (module == NULL)
@@ -147,10 +147,7 @@ int insmod_check(const char *modname)
             return 1;
         }
     }
-    else
-    {
-        ALOGW("driver %s is not detected!,\n", modname);
-    }
+    ALOGW("driver %s is not detected!,\n", modname);
     fclose(modules);
     return 0;
 }
@@ -211,7 +208,7 @@ int insmod(const char *filename, const char *args,
 
 int rmmod(const char *modname, int timeout_ms)
 {
-    int ret = -1;
+    int ret;
     int count = 1;
 
     do
@@ -315,11 +312,15 @@ int read_hci_event(int fd, unsigned char *buf, int size)
     while (1)
     {
         r = read(fd, buf, 1);
-        /*if (r <= 0)
+        if (r == 0)
         {
-            ALOGE("read_hci_event err: %s \n", strerror(errno));
+            ALOGE("type no data: %s r %d\n", strerror(errno), r);
+        }
+        else if (r < 0)
+        {
+            ALOGE("type err: %s r %d\n", strerror(errno), r);
             return -1;
-        }*/
+        }
 
         if (buf[0] == 0x04)
         {
@@ -340,8 +341,15 @@ int read_hci_event(int fd, unsigned char *buf, int size)
     while (count < 3)
     {
         r = read(fd, buf + count, 3 - count);
-        if (r <= 0)
+        if (r == 0)
+        {
+            ALOGD("header no data: %s r %d\n", strerror(errno), r);
+        }
+        else if (r < 0)
+        {
+            ALOGE("header err: %s r %d\n", strerror(errno), r);
             return -1;
+        }
         count += r;
         usleep(5000);
         if (retry_cnt > TIMEOUT_TRYSUM*10)
@@ -357,11 +365,22 @@ int read_hci_event(int fd, unsigned char *buf, int size)
         remain = buf[2];
     else
         remain = size - 3;
+    if (remain > size -3) {
+        ALOGE("Param length %d ", remain);
+        return -1;
+    }
     while ((count - 3) < remain)
     {
         r = read(fd, buf + count, remain - (count - 3));
-        if (r <= 0)
+        if (r == 0)
+        {
+            ALOGD("playload no data: %s r %d\n", strerror(errno), r);
+        }
+        else if (r < 0)
+        {
+            ALOGE("playload err: %s r %d\n", strerror(errno), r);
             return -1;
+        }
         count += r;
         usleep(5000);
         if (retry_cnt > TIMEOUT_TRYSUM*15)
@@ -375,9 +394,108 @@ int read_hci_event(int fd, unsigned char *buf, int size)
     return count;
 }
 
+int read_hci_event_poll(int fd, unsigned char *buf, int size, int timeout_ms)
+{
+    int remain, r;
+    int count = 0;
+    fd_set rfds;
+    struct timeval tv;
+    int retval;
+
+    if (size <= 0) {
+        ALOGE("Invalid size argument!");
+        return -1;
+    }
+
+    // step1: read hci type
+    while (1) {
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        retval = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (retval == -1) {
+            ALOGE("select error: %s", strerror(errno));
+            return -1;
+        } else if (retval == 0) {
+            ALOGE("select timeout waiting for type byte");
+            return -1;
+        }
+
+        r = read(fd, buf, 1);
+        if (r <= 0) {
+            ALOGE("read type byte failed: %s", strerror(errno));
+            return -1;
+        }
+
+        if (buf[0] == 0x04) {
+            break;
+        }
+    }
+    count++;
+
+    // step2: read HCI event header
+    while (count < 3) {
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        retval = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (retval <= 0) {
+            ALOGE("select timeout/error waiting for header");
+            return -1;
+        }
+
+        r = read(fd, buf + count, 3 - count);
+        if (r <= 0) {
+            ALOGE("read header failed: %s", strerror(errno));
+            return -1;
+        }
+        count += r;
+    }
+
+    // step3: read payload
+    if (buf[2] < (size - 3))
+        remain = buf[2];
+    else
+        remain = size - 3;
+
+    if (remain > size - 3) {
+        ALOGE("Param length %d exceeds buffer", remain);
+        return -1;
+    }
+
+    while ((count - 3) < remain) {
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        retval = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (retval <= 0) {
+            ALOGE("select timeout/error waiting for payload");
+            return -1;
+        }
+
+        r = read(fd, buf + count, remain - (count - 3));
+        if (r <= 0) {
+            ALOGE("read payload failed: %s", strerror(errno));
+            return -1;
+        }
+        count += r;
+    }
+
+    return count;
+}
+
+
 int aml_hci_send_cmd(int fd, unsigned char *cmd, int cmdsize, unsigned char *rsp)
 {
     int err = 0;
+    int retry_cnt = 0;
 
     //ALOGD("%s [abner test]: ", __FUNCTION__);
     err = do_write(fd, cmd, cmdsize);
@@ -390,11 +508,10 @@ int aml_hci_send_cmd(int fd, unsigned char *cmd, int cmdsize, unsigned char *rsp
 
     usleep(20000);
 
-    memset(rsp, 0, HCI_MAX_EVENT_SIZE);
-
     /* Wait for command complete event */
-    while (1)
+    while (retry_cnt++ < MAX_READ_EVENT_CNT)
     {
+        memset(rsp, 0, HCI_MAX_EVENT_SIZE);
         //Wait for command complete event
         err = read_hci_event(fd, rsp, HCI_MAX_EVENT_SIZE);
         ALOGD("aml_hci_send_cmd read rsp [%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]",
@@ -409,6 +526,53 @@ int aml_hci_send_cmd(int fd, unsigned char *cmd, int cmdsize, unsigned char *rsp
         {
             break;
         }
+    }
+    if (retry_cnt >= MAX_READ_EVENT_CNT)
+    {
+        ALOGE("%s: Failed to match event", __FUNCTION__);
+    }
+error:
+    return err;
+}
+
+int aml_hci_send_cmd_poll(int fd, unsigned char *cmd, int cmdsize, unsigned char *rsp)
+{
+    int err = 0;
+    int retry_cnt = 0;
+
+    //ALOGD("%s [abner test]: ", __FUNCTION__);
+    err = do_write(fd, cmd, cmdsize);
+    if (err != cmdsize)
+    {
+        ALOGE("%s: Send failed with ret value: %d", __FUNCTION__, err);
+        err = -1;
+        goto error;
+    }
+
+    usleep(20000);
+
+    /* Wait for command complete event */
+    while (retry_cnt++ < MAX_READ_EVENT_CNT)
+    {
+        memset(rsp, 0, HCI_MAX_EVENT_SIZE);
+        //Wait for command complete event
+        err = read_hci_event_poll(fd, rsp, HCI_MAX_EVENT_SIZE, 2000);
+        ALOGD("aml_hci_send_cmd read rsp [%#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x, %#x]",
+            rsp[0], rsp[1], rsp[2], rsp[3], rsp[4], rsp[5], rsp[6], rsp[7], rsp[8], rsp[9], rsp[10], rsp[11]);
+        if (err < 0)
+        {
+            ALOGE("%s: Failed to set patch info on Controller", __FUNCTION__);
+            goto error;
+        }
+
+        if (rsp[0] == 0x04 && (rsp[1] == 0x0e || rsp[1] == 0x19))
+        {
+            break;
+        }
+    }
+    if (retry_cnt >= MAX_READ_EVENT_CNT)
+    {
+        ALOGE("%s: Failed to match event", __FUNCTION__);
     }
 error:
     return err;
@@ -477,32 +641,41 @@ int hci_read_event(int fd, unsigned char *buf, int size)
 
     /* The first byte identifies the packet type. For HCI event packets, it
      * should be 0x04, so we read until we get to the 0x04. */
-    while (retry_cnt < 40)
+    while (retry_cnt < MAX_READ_EVENT_CNT/4)
     {
         r = read(fd, buf, 1);
         if (r <= 0)
         {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
+            if ((r < 0) && errno != EAGAIN && errno != EWOULDBLOCK)
             {
-                ALOGD("read_hci_event err: %s \n", strerror(errno));
+                ALOGE("type %s err: %s \n", __func__, strerror(errno));
                 return -1;
             }
             else
             {
                 usleep(1000);
-                ALOGD("hci_read_event retry_cnt %d", retry_cnt);
+                ALOGD("type %s retry_cnt %d", __func__, retry_cnt);
                 retry_cnt++;
                 continue;
             }
         }
-
-        if (buf[0] == 0x04)
-            break;
+        else
+        {
+            if (buf[0] == 0x04)
+            {
+                break;
+            }
+            else
+            {
+                ALOGE("type %s err: %s buf[0] %#x\n", __func__, strerror(errno), buf[0]);
+                return -1;
+            }
+        }
     }
-    if (retry_cnt >= 40)
+    if (retry_cnt >= MAX_READ_EVENT_CNT/4)
     {
-        ALOGD("hci_read_event err: retry count max!\n");
-        return -1;
+        ALOGD("type %s err: retry count max!\n", __func__);
+        return 0;
     }
     count++;
     retry_cnt = 0;
@@ -512,19 +685,19 @@ int hci_read_event(int fd, unsigned char *buf, int size)
         r = read(fd, buf + count, 3 - count);
         if (r <= 0)
         {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
+            if ((r < 0) && errno != EAGAIN && errno != EWOULDBLOCK)
             {
-                ALOGD("read_hci_event header err: %s \n", strerror(errno));
+                ALOGE("header %s err: %s \n", __func__, strerror(errno));
                 return -1;
             }
             else
             {
                 usleep(1000);
-                ALOGD("hci_read_event header retry_cnt %d", retry_cnt);
+                ALOGD("header %s retry_cnt %d", __func__, retry_cnt);
                 retry_cnt++;
-                if (retry_cnt >= 40)
+                if (retry_cnt >= MAX_READ_EVENT_CNT/4)
                 {
-                    ALOGD("hci_read_event header err: retry count max!\n");
+                    ALOGD("header %s err: retry count max!\n", __func__);
                     return -1;
                 }
                 continue;
@@ -538,25 +711,29 @@ int hci_read_event(int fd, unsigned char *buf, int size)
         remain = buf[2];
     else
         remain = size - 3;
+    if (remain > size -3) {
+        ALOGE("Param length %d ", remain);
+        return -1;
+    }
     retry_cnt = 0;
     while ((count - 3) < remain)
     {
         r = read(fd, buf + count, remain - (count - 3));
         if (r <= 0)
         {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
+            if ((r < 0) && errno != EAGAIN && errno != EWOULDBLOCK)
             {
-                ALOGD("read_hci_event payload err: %s \n", strerror(errno));
+                ALOGE("payload %s err: %s \n", __func__, strerror(errno));
                 return -1;
             }
             else
             {
                 usleep(1000);
-                ALOGD("hci_read_event payload retry_cnt %d", retry_cnt);
+                ALOGD("payload %s retry_cnt %d", __func__, retry_cnt);
                 retry_cnt++;
-                if (retry_cnt >= 40)
+                if (retry_cnt >= MAX_READ_EVENT_CNT/4)
                 {
-                    ALOGD("hci_read_event payload err: retry count max!\n");
+                    ALOGD("payload %s err: retry count max!\n", __func__);
                     return -1;
                 }
                 continue;
@@ -602,6 +779,16 @@ void aml_reset_bt(int fd)
     ALOGD("aml_reset_bt end\n");
 }
 
+void aml_reset_bt_poll(int fd)
+{
+    unsigned char reset_cmd[] = {0x01, 0x03, 0x0C, 0x00};
+    unsigned char rsp[HCI_MAX_EVENT_SIZE];
+
+    ALOGD("aml_reset_bt \n");
+    aml_hci_send_cmd_poll(fd, (unsigned char *)reset_cmd, sizeof(reset_cmd), (unsigned char *)rsp);
+    ALOGD("aml_reset_bt end\n");
+}
+
 /*****************ioctl*****************/
 
 unsigned char aml_get_w2l_coex_status(int fd)
@@ -642,6 +829,7 @@ int aml_uart_init(void)
     int err = 0;
     unsigned char expected_rsp[] = {0x4,0xe,0x4,0x1,0xf2,0xfe};
     int retry = 0;
+    int retry_cnt = 0;
 
     userial_vendor_set_baud(line_speed_to_userial_baud(115200));
 
@@ -668,8 +856,9 @@ int aml_uart_init(void)
             continue;
         }
 
-        while (1)
+        while (retry_cnt++ < MAX_READ_EVENT_CNT/2)
         {
+            memset(rsp, 0, HCI_MAX_EVENT_SIZE);
             /* Wait for command complete event */
             err = hci_read_event(g_userial_fd, rsp, HCI_MAX_EVENT_SIZE);
             if (err < 0)
@@ -677,12 +866,20 @@ int aml_uart_init(void)
                 ALOGD("Failed to read rsp from RTL!");
                 break;
             }
+            else if (err == 0)
+            {
+                ALOGD("wait to read rsp from RTL!");
+            }
             else
             {
                 ALOGD("rsp:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]",  \
                     rsp[0],rsp[1],rsp[2],rsp[3],rsp[4],rsp[5],rsp[6],rsp[7]);
                 break;
             }
+        }
+        if (retry_cnt >= MAX_READ_EVENT_CNT/2)
+        {
+            ALOGE("%s: Failed to match event", __FUNCTION__);
         }
 
         if (!memcmp(expected_rsp, rsp, sizeof(expected_rsp)))
@@ -698,6 +895,7 @@ int aml_uart_init(void)
             retry++;
             ALOGD("uart set baud failed!!!!!!!!!!!!!!!!!!!!!!!!, retry %d", retry);
         }
+        retry_cnt = 0;
     }
 
     if (retry >= 3)
@@ -728,6 +926,7 @@ int aml_uart_get_pmu(void)
     unsigned char *p = &cmd[1];
     int err = 0;
     unsigned char expected_rsp[] = {0x4,0xe,0x8,0x1,0xf0,0xfe,0,0x6};
+    unsigned int retry_cnt = 0;
 
     UINT16_TO_STREAM(p, TCI_READ_REG);
     *p++ = 4;
@@ -738,8 +937,9 @@ int aml_uart_get_pmu(void)
         return -1;
     }
 
-    while (1)
+    while (retry_cnt++ < MAX_READ_EVENT_CNT/2)
     {
+        memset(rsp, 0, HCI_MAX_EVENT_SIZE);
         /* Wait for command complete event */
         err = hci_read_event(g_userial_fd, rsp, HCI_MAX_EVENT_SIZE);
         if (err < 0)
@@ -747,12 +947,20 @@ int aml_uart_get_pmu(void)
             ALOGD("Failed to read rsp from RTL!");
             break;
         }
+        else if (err == 0)
+        {
+            ALOGD("wait to read rsp from RTL!");
+        }
         else
         {
             ALOGD("rsp:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]",  \
                 rsp[0],rsp[1],rsp[2],rsp[3],rsp[4],rsp[5],rsp[6],rsp[7]);
             break;
         }
+    }
+    if (retry_cnt >= MAX_READ_EVENT_CNT/2)
+    {
+        ALOGE("%s: Failed to match event", __FUNCTION__);
     }
 
     //if (!memcmp(expected_rsp, rsp, sizeof(expected_rsp)))
@@ -777,6 +985,7 @@ int aml_uart_rtl_dbg(unsigned int addr)
     unsigned char rsp[HCI_MAX_EVENT_SIZE] = {0};
     unsigned char *p = &cmd[1];
     int err = 0;
+    int retry_cnt = 0;
 
     UINT16_TO_STREAM(p, TCI_READ_REG);
     *p++ = 4;
@@ -787,8 +996,9 @@ int aml_uart_rtl_dbg(unsigned int addr)
         return -1;
     }
     ALOGD("aml_uart_rtl_dbg %#x", addr);
-    while (1)
+    while (retry_cnt++ < MAX_READ_EVENT_CNT/2)
     {
+        memset(rsp, 0, HCI_MAX_EVENT_SIZE);
         /* Wait for command complete event */
         err = hci_read_event(g_userial_fd, rsp, HCI_MAX_EVENT_SIZE);
         if (err < 0)
@@ -796,12 +1006,20 @@ int aml_uart_rtl_dbg(unsigned int addr)
             ALOGD("Failed to read rsp from RTL!");
             break;
         }
+        else if (err == 0)
+        {
+            ALOGD("wait to read rsp from RTL!");
+        }
         else
         {
             ALOGD("rsp:[%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x,%#x]",  \
                 rsp[0],rsp[1],rsp[2],rsp[3],rsp[4],rsp[5],rsp[6],rsp[7],rsp[8],rsp[9],rsp[10],rsp[11]);
             break;
         }
+    }
+    if (retry_cnt >= MAX_READ_EVENT_CNT/2)
+    {
+        ALOGE("%s: Failed to match event", __FUNCTION__);
     }
 
     ALOGD("aml_uart_rtl_dbg end");
@@ -817,6 +1035,12 @@ void aml_15p4_data_cb(void *p)
     unsigned short len = ((p_mem[3] << 8) | p_mem[2]);
     int size;
     unsigned char buf[AML_15P4_SOCKET_SIZE] = {0};
+
+    if (len > AML_15P4_SOCKET_SIZE - 7)
+    {
+        ALOGE("%s: Invalid len %hu (max allowed: %zu)\n", __func__, len, AML_15P4_SOCKET_SIZE - 7);
+        return;
+    }
 
     buf[0] = 0x10;
     memcpy(&buf[1], p_mem, len + 4 + 2);
@@ -849,7 +1073,7 @@ void* aml_15p4_socket(void* arg)
     int read_len = 0;
     fd_set read_fd;
     fd_set error_fd;
-    int max_fd = -1;
+    int max_fd;
     int rval;
     struct timeval timeout = {0, 5000};
     char _15p4_buf[AML_15P4_CMD_BUF_SIZE] = {0};
@@ -903,7 +1127,6 @@ void* aml_15p4_socket(void* arg)
         timeout.tv_usec = 5000;
         FD_ZERO(&read_fd);
         FD_ZERO(&error_fd);
-        max_fd = -1;
         if (listenSocket != -1)
         {
             FD_SET(listenSocket, &read_fd);
@@ -948,7 +1171,7 @@ void* aml_15p4_socket(void* arg)
             sessionSocket = -1;
         }
 
-        if (FD_ISSET(sessionSocket, &read_fd))
+        if (FD_ISSET(sessionSocket, &read_fd) && sessionSocket != -1)
         {
             memset(_15p4_buf, 0, sizeof(_15p4_buf));
             data_len = recv(sessionSocket, _15p4_buf, 5, 0);
@@ -1017,5 +1240,22 @@ done:
     return NULL;
 }
 
+int amlbt_chardev_open(char *addr)
+{
+    int cnt = 0;
+    int fd = -1;
 
+open_retry:
+    if ((fd = open(addr, O_RDWR)) < 0)
+    {
+        ALOGE("%s: unable to open %s: %s %d", __func__, addr, strerror(errno), cnt);
+        usleep(50000);
+        cnt++;
+        if (cnt < 40)
+            goto open_retry;
+        ALOGE("%s fail!!", addr);
+        return -1;
+    }
+    return fd;
+}
 

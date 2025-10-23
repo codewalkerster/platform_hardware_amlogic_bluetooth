@@ -19,6 +19,38 @@
 #ifndef VENDOR_COMMON_H
 #define VENDOR_COMMON_H
 
+struct amlbt_diag_entry {
+    unsigned char  type;
+    unsigned int w;           // write pointer
+    unsigned int r;           // read pointer
+
+    unsigned char  mon;
+    unsigned char  day;
+    unsigned char  hour;
+    unsigned char  min;
+    unsigned char  sec;
+    unsigned short ms;          // [0-999]
+
+    unsigned char  opcode;      //
+    unsigned char  info[7];     //
+    unsigned int fw_log_cnt;  //
+} __packed;
+
+struct amlbt_diag_buf
+{
+    unsigned int count;
+    unsigned int max;
+    unsigned char fw_log[516];
+    struct amlbt_diag_entry entries[];
+} __packed;
+
+struct amlbt_diag_remain_buf
+{
+    unsigned int count;
+    unsigned int max;
+    struct amlbt_diag_entry entries[0];
+};
+
 //ioctl
 #define BTUSB_IOC_MAGIC 'x'
 #define IOCTL_GET_BT_RECOVERY                   _IOR(BTUSB_IOC_MAGIC, 0, int)
@@ -29,6 +61,16 @@
 #define IOCTL_REGISTER_SDIO                     _IOW(BTUSB_IOC_MAGIC, 9, int)
 #define IOCTL_UNREGISTER_SDIO                   _IOW(BTUSB_IOC_MAGIC, 10, int)
 #define IOCTL_GET_SDIO_PROBE_STATUS             _IOR(BTUSB_IOC_MAGIC, 11, int)
+#define IOCTL_SET_BT_RECOVERY                   _IOW(BTUSB_IOC_MAGIC, 12, int)
+#define IOCTL_SET_BT_UART_RESET                 _IO(BTUSB_IOC_MAGIC, 13)
+#define IOCTL_GET_DEVICE_CID                    _IOR(BTUSB_IOC_MAGIC, 14, int)
+#define IOCTL_SET_BT_EN_ENABLE                  _IO(BTUSB_IOC_MAGIC, 16)
+
+#define IOCTL_GET_DRIVER_VERSION                _IOR(BTUSB_IOC_MAGIC, 20, int)
+#define IOCTL_GET_DIAG_COUNT                    _IOR(BTUSB_IOC_MAGIC, 21, int)
+#define IOCTL_GET_DIAG_BUFF                     _IOR(BTUSB_IOC_MAGIC, 22, struct amlbt_diag_buf)
+#define IOCTL_GET_DIAG_REMAIN_COUNT             _IOR(BTUSB_IOC_MAGIC, 23, int)
+#define IOCTL_GET_DIAG_REMAIN_BUFF              _IOR(BTUSB_IOC_MAGIC, 24, struct amlbt_diag_remain_buf)
 
 #define W1U_ROM_START_CODE                      0x0cc0006f
 
@@ -79,6 +121,9 @@
 #define RG_AON_A                                (0x00f00094)
 #define W1U_RG_AON_A                            (0x1)
 #define W1_RG_AON_A                             (0x0)
+#define MIN_ALLOC_SIZE                          1
+#define MAX_ALLOC_SIZE                          (1024 * 1024) // max 1MB
+#define MAX_READ_EVENT_CNT                      40
 
 //bt used reg
 #define REG_DEV_RESET                           0xf03058
@@ -87,6 +132,9 @@
 #define REG_FW_MODE                             0xf000e0
 #define RG_AON_A53                              0xf000d4
 #define RG_AON_A59                              0xf000ec
+
+//debug dev
+#define AML_BT_CHAR_DEBUG_DEVICE_ADDR "/dev/aml_bt_debug"
 
 //15.4 socket
 #define rev_15p4_cmd_fifo "/data/vendor/bluetooth/fifo_cmd_out"
@@ -138,6 +186,7 @@ extern uint8_t hw_lpm_enable(uint8_t turn_on);
 extern void hw_lpm_set_wake_state(uint8_t wake_assert);
 
 unsigned int amlbt_get_reg(unsigned int addr);
+void libbt_save_diag_buff(int fd);
 void save_regs_to_file(unsigned char *buf, size_t len, const char *filepath);
 void save_regs_with_time_str(unsigned char *buf, size_t len, const char *filepath);
 
@@ -153,6 +202,7 @@ int hci_write_cmd(int fd, unsigned char *buf, int len);
 int hci_read_event(int fd, unsigned char *buf, int size);
 int aml_woble_configure(int fd);
 void aml_reset_bt(int fd);
+void aml_reset_bt_poll(int fd);
 unsigned char aml_get_w2l_coex_status(int fd);
 void aml_get_w2l_chip_function(int fd);
 int aml_uart_init(void);
@@ -161,6 +211,7 @@ int aml_uart_rtl_dbg(unsigned int addr);
 void aml_15p4_data_cb(void *p);
 void aml_15p4_deinit(void);
 void* aml_15p4_socket(void* arg);
+int amlbt_chardev_open(char *addr);
 
 enum
 {

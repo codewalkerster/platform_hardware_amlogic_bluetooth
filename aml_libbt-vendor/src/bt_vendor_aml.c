@@ -96,7 +96,7 @@ static int check_key_value(char *path, char *key, int value)
     char string_get[12];
     int value_int = 0;
     memset(newpath, 0, 100);
-    sprintf(newpath, "%s/%s", path, key);
+    snprintf(newpath, sizeof(newpath), "%s/%s", path, key);
 
     if ((fp = fopen(newpath, "r")) != NULL)
     {
@@ -120,7 +120,7 @@ static int get_key_value(char *path, char *key)
     char string_get[12];
     int value_int = 0;
     memset(newpath, 0, 100);
-    sprintf(newpath, "%s/%s", path, key);
+    snprintf(newpath, sizeof(newpath), "%s/%s", path, key);
     if ((fp = fopen(newpath, "r")) != NULL)
     {
         ALOGD("get_key_value %s \n", newpath);
@@ -143,25 +143,48 @@ static void scan_aml_usb_devices(char *path)
     struct stat filestat;
     unsigned int w2 = 0;
     unsigned int pid = 0;
+    int dir_fd;
 
-    if (stat(path, &filestat) != 0)
+    if (!path)
     {
-        ALOGE("The file or path(%s) can not be get stat!\n", newpath);
+        ALOGE("NULL path provided");
         return ;
     }
-    if ((filestat.st_mode & S_IFDIR) != S_IFDIR)
+
+    dir_fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0)
+    {
+        ALOGE("Cannot open directory %s: %s", path, strerror(errno));
+        return ;
+    }
+
+    if (fstat(dir_fd, &filestat) != 0)
+    {
+        ALOGE("The file or path(%s) can not be get stat!\n", newpath);
+        close(dir_fd);
+        return ;
+    }
+    if (!S_ISDIR(filestat.st_mode))
     {
         ALOGE("(%s) is not be a path!\n", path);
+        close(dir_fd);
         return;
     }
-    pdir = opendir(path);
+
+    pdir = fdopendir(dir_fd);
+    if (!pdir)
+    {
+        ALOGE("Cannot fdopendir directory %s: %s\n", path, strerror(errno));
+        close(dir_fd);
+        return ;
+    }
     /*enter sub direc*/
     while ((ptr = readdir(pdir)) != NULL)
     {
         if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0)
             continue;
         memset(newpath, 0, sizeof(newpath));
-        sprintf(newpath, "%s/%s", path, ptr->d_name);
+        snprintf(newpath, sizeof(newpath), "%s/%s", path, ptr->d_name);
         ALOGD("[AML_USB] The file or path(%s)\n", newpath);
         if (stat(newpath, &filestat) != 0)
         {
@@ -198,7 +221,10 @@ static void scan_aml_usb_devices(char *path)
             }
         }
     }
-    closedir(pdir);
+    if (pdir)
+    {
+        closedir(pdir);
+    }
 }
 
 static int amlbt_sdio_check(char *subpathdst)
@@ -249,7 +275,7 @@ static int scan_file_sys(char *path, int level)
         if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0)
             continue;
         memset(newpath, 0, sizeof(newpath));
-        sprintf(newpath, "%s/%s", path, ptr->d_name);
+        snprintf(newpath, sizeof(newpath), "%s/%s", path, ptr->d_name);
         ALOGD("[AML_SDIO] The file or path(%d:%s)\n", level, newpath);
         if (stat(newpath, &filestat) != 0)
         {
